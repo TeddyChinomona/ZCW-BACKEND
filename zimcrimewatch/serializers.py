@@ -2,9 +2,9 @@
 ZimCrimeWatch - DRF Serializers
 Handles serialization/deserialization for all models and API payloads.
 """
-from django.contrib.auth.models import User
+from .models import CustomUser as User
 from rest_framework import serializers
-from .models import CrimeType, ZRPProfile, CrimeIncident
+from .models import CrimeType, CrimeIncident
 
 
 # ---------------------------------------------------------------------------
@@ -18,30 +18,32 @@ class LoginSerializer(serializers.Serializer):
 
 class UserSerializer(serializers.ModelSerializer):
     role = serializers.SerializerMethodField()
-    full_name = serializers.SerializerMethodField()
     badge_number = serializers.SerializerMethodField()
     station = serializers.SerializerMethodField()
 
     class Meta:
         model = User
-        fields = ["id", "username", "email", "is_active", "role", "full_name", "badge_number", "station"]
+        fields = [
+            "id", 
+            "username",  
+            "is_active", 
+            "role", 
+            "full_name", 
+            "badge_number", 
+            "base_station"
+        ]
 
     def get_role(self, obj):
-        return obj.zrp_profile.role if hasattr(obj, "zrp_profile") else None
-
-    def get_full_name(self, obj):
-        return obj.zrp_profile.full_name if hasattr(obj, "zrp_profile") else obj.get_full_name()
+        return obj.role if hasattr(obj, "zrp_profile") else None
 
     def get_badge_number(self, obj):
         return obj.zrp_profile.badge_number if hasattr(obj, "zrp_profile") else ""
 
     def get_station(self, obj):
-        return obj.zrp_profile.station if hasattr(obj, "zrp_profile") else ""
-
+        return obj.station if hasattr(obj, "zrp_profile") else ""
 
 class CreateUserSerializer(serializers.Serializer):
     username = serializers.CharField(max_length=150)
-    email = serializers.EmailField()
     password = serializers.CharField(write_only=True, min_length=8)
     full_name = serializers.CharField(max_length=255)
     badge_number = serializers.CharField(max_length=50, required=False, default="")
@@ -52,7 +54,6 @@ class CreateUserSerializer(serializers.Serializer):
         if User.objects.filter(username=value).exists():
             raise serializers.ValidationError("A user with this username already exists.")
         return value
-
 
 # ---------------------------------------------------------------------------
 # Crime type serializer
@@ -134,7 +135,7 @@ class HeatmapRequestSerializer(serializers.Serializer):
     bandwidth = serializers.FloatField(required=False, default=0.01, min_value=0.001, max_value=1.0)
     grid_size = serializers.IntegerField(required=False, default=50, min_value=10, max_value=200)
     bounds = serializers.DictField(required=False, child=serializers.FloatField(), allow_null=True,
-                                   help_text="{'min_lat': ..., 'max_lat': ..., 'min_lng': ..., 'max_lng': ...}")
+    help_text="{'min_lat': ..., 'max_lat': ..., 'min_lng': ..., 'max_lng': ...}")
 
 
 class TimeSeriesRequestSerializer(serializers.Serializer):

@@ -1,3 +1,8 @@
 from django.contrib import admin
+from .models import *
 
-# Register your models here.
+admin.site.register(CustomUser)
+admin.site.register(BaseStation)
+admin.site.register(Station)
+admin.site.register(CrimeType)
+admin.site.register(CrimeIncident)

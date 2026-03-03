@@ -42,7 +42,7 @@ from django.contrib.auth.models import User
 from django.db.models import Count, Q
 from django.utils import timezone
 from rest_framework import status
-from rest_framework.authentication import SessionAuthentication, TokenAuthentication
+from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework.authtoken.models import Token
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
@@ -54,7 +54,8 @@ from .ml_utils import (
     compute_kde_heatmap,
     compute_time_series,
 )
-from .models import CrimeIncident, CrimeType, ZRPProfile
+from django.contrib.auth.views import get_user_model
+from .models import CrimeIncident, CrimeType, CustomUser
 from .permissions import IsZRPAdmin, IsZRPAnalystOrAdmin, IsZRPAuthenticated
 from .serializers import (
     CrimeIncidentSerializer,
@@ -68,6 +69,7 @@ from .serializers import (
     UserSerializer,
 )
 
+user = get_user_model()
 
 # =============================================================================
 # Helpers
@@ -147,10 +149,14 @@ class LoginView(APIView):
                 {"detail": "Account is disabled."},
                 status=status.HTTP_403_FORBIDDEN,
             )
-
-        token, _ = Token.objects.get_or_create(user=user)
-        user_data = UserSerializer(user).data
-        return Response({"token": token.key, "user": user_data}, status=status.HTTP_200_OK)
+        refresh = RefreshToken.for_user(user)
+        data = {
+            "message": f"User {user.username} logged in successfully",
+            "success": True,
+            "refresh": str(refresh),
+            "access": str(refresh.access_token)
+        }
+        return Response(data, status=status.HTTP_200_OK)
 
 
 class LogoutView(APIView):
@@ -162,7 +168,7 @@ class LogoutView(APIView):
 
     def post(self, request):
         try:
-            request.user.auth_token.delete()
+            pass
         except Exception:
             pass
         return Response({"detail": "Logged out."}, status=status.HTTP_200_OK)
@@ -853,30 +859,23 @@ class UserListCreateView(APIView):
     permission_classes = [IsZRPAdmin]
 
     def get(self, request):
-        users = User.objects.filter(zrp_profile__isnull=False).select_related("zrp_profile").order_by("username")
+        users = User.objects.all().select_related("base_station").order_by("username")
         serializer = UserSerializer(users, many=True)
         return Response(serializer.data)
 
     def post(self, request):
-        serializer = CreateUserSerializer(data=request.data)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        data = serializer.validated_data
-        user = User.objects.create_user(
-            username=data["username"],
-            email=data["email"],
-            password=data["password"],
+        """Create a new account"""
+        request_data = request.data
+        created_user = user.objects.create_user(
+            username=request_data.get('username'),
+            first_name=request_data.get('first_name'),
+            last_name=request_data.get('last_name'),
+            email=request_data.get('zrp_badge_number'),
+            password=request_data.get('password'),
+            role = request_data.get('role')
         )
-        ZRPProfile.objects.create(
-            user=user,
-            full_name=data["full_name"],
-            badge_number=data.get("badge_number", ""),
-            station=data.get("station", ""),
-            role=data["role"],
-        )
-        return Response(UserSerializer(user).data, status=status.HTTP_201_CREATED)
-
+        data = {"message": f"Account created{created_user.username}"}
+        return Response(data, status.HTTP_201_CREATED)
 
 class UserDetailView(APIView):
     """
@@ -888,7 +887,7 @@ class UserDetailView(APIView):
 
     def _get_user(self, pk):
         try:
-            return User.objects.select_related("zrp_profile").get(pk=pk)
+            return User.objects.select_related("base_station").get(pk=pk)
         except User.DoesNotExist:
             return None
 
@@ -904,10 +903,10 @@ class UserDetailView(APIView):
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
 
         # Update allowed fields
-        profile = user.zrp_profile
-        profile.full_name = request.data.get("full_name", profile.full_name)
-        profile.badge_number = request.data.get("badge_number", profile.badge_number)
-        profile.station = request.data.get("station", profile.station)
+        profile = user
+        profile.fullname = request.data.get("full_name", profile.full_name)
+        profile.zrp_badge_number = request.data.get("badge_number", profile.zrp_badge_number)
+        profile.base_station = request.data.get("station", profile.base_station)
         new_role = request.data.get("role")
         if new_role and new_role in ("analyst", "officer", "admin"):
             profile.role = new_role

@@ -77,7 +77,7 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'ZWC_BACKEND.wsgi.application'
-
+AUTH_USER_MODEL = "zimcrimewatch.CustomUser"
 
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases

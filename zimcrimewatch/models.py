@@ -3,9 +3,107 @@ ZimCrimeWatch - Django Models
 Defines all database entities for the ZRP crime analytics system.
 """
 from django.db import models
-from django.contrib.auth.models import User
 from django.utils import timezone
+from django.core.exceptions import ValidationError
+from django.contrib.gis.db import models as gis_models
+from django.contrib.auth.models import (
+    AbstractBaseUser,
+    BaseUserManager,
+    PermissionsMixin
+)
 
+class CustomUserManager(BaseUserManager):
+    """Manager for CustomUser model"""
+    def create_superuser(self, username, first_name, last_name, zrp_badge_number, password, **other_fields):
+        """Create and save a superuser with the given details."""
+        other_fields.setdefault('is_superuser', True)
+        other_fields.setdefault('is_staff', True)
+        other_fields.setdefault('is_active', True)
+
+        if other_fields.get('is_superuser') is not True:
+            raise ValidationError(message= "Superuser must be set to True")
+
+        if other_fields.get('is_staff') is not True:
+            raise ValidationError(message= "Staff must be set to True")
+
+        if other_fields.get('is_active') is not True:
+            raise ValidationError(message= "Active must be set to True")
+
+        return self.create_user(username, first_name, last_name, zrp_badge_number, password, **other_fields)
+
+    def create_user(self, username, first_name, last_name, zrp_badge_number, password, **other_fields):
+        """Create and save a regular user with the given details."""
+        if not zrp_badge_number:
+            raise ValidationError(message="ZRP badge number cannot be empty")
+
+        user = self.model(
+            fullname = f"{first_name} {last_name}",
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            zrp_badge_number=zrp_badge_number,
+            **other_fields
+        )
+        user.set_password(password)
+        user.save()
+        return user
+
+class CustomUser(AbstractBaseUser, PermissionsMixin):
+    """Custom User model"""
+    ROLE_CHOICES = [
+        ("analyst", "Analyst"),
+        ("officer", "Officer"),
+        ("admin", "Administrator"),
+    ]
+    fullname = models.CharField(max_length=255, null=True)
+    username = models.CharField(max_length=20)
+    first_name = models.CharField(max_length=20)
+    last_name = models.CharField(max_length=20)
+    zrp_badge_number = models.CharField(max_length=20, unique=True)
+    base_station = models.ForeignKey('BaseStation', on_delete=models.PROTECT, null=True, blank=True)
+    role = models.CharField(max_length=10, choices=ROLE_CHOICES, default='PUBLIC')
+    is_active = models.BooleanField(default=True)
+    is_staff = models.BooleanField(default=True)
+
+    objects = CustomUserManager()
+    USERNAME_FIELD = 'zrp_badge_number'
+    REQUIRED_FIELDS = ['username', 'first_name', 'last_name']
+    
+    def __str__(self):
+        return f"Username: {self.username}  Active: {self.is_active}"
+
+class Station(models.Model):
+    """Model representing a police station."""
+    code = models.CharField(max_length=10, unique=True, null=True)
+    name = models.CharField(max_length=100)
+    location = gis_models.PointField(srid=4326, null=True, blank=True)
+
+    def __str__(self):
+        return f"Station: {self.name}"
+
+class BaseStation(models.Model):
+    """Model representing a base station."""
+    name = models.CharField(max_length=100)
+    station = models.ForeignKey(
+        'Station',
+        on_delete=models.PROTECT,
+        related_name='base_stations',
+        blank=True
+    )
+    location = gis_models.PointField(srid=4326, null=True, blank=True)
+
+    def __str__(self):
+        return f"Base Station: {self.name}"
+
+# class ZRPProfile(models.Model):
+#     """Extends the base Django User with ZRP-specific role information."""
+    
+#     full_name = models.CharField(max_length=255)
+#     badge_number = models.CharField(max_length=50, blank=True, default="")
+#     station = models.CharField(max_length=150, blank=True, default="")
+
+#     def __str__(self):
+#         return f"{self.full_name} ({self.role})"
 
 class CrimeType(models.Model):
     """Lookup table for crime categories used across the system."""
@@ -18,24 +116,6 @@ class CrimeType(models.Model):
 
     def __str__(self):
         return self.name
-
-
-class ZRPProfile(models.Model):
-    """Extends the base Django User with ZRP-specific role information."""
-    ROLE_CHOICES = [
-        ("analyst", "Analyst"),
-        ("officer", "Officer"),
-        ("admin", "Administrator"),
-    ]
-    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="zrp_profile")
-    full_name = models.CharField(max_length=255)
-    badge_number = models.CharField(max_length=50, blank=True, default="")
-    station = models.CharField(max_length=150, blank=True, default="")
-    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default="analyst")
-
-    def __str__(self):
-        return f"{self.full_name} ({self.role})"
-
 
 class CrimeIncident(models.Model):
     """Core entity representing a single crime incident reported to the ZRP."""
@@ -67,10 +147,8 @@ class CrimeIncident(models.Model):
     time_of_day = models.CharField(max_length=20, choices=TIME_OF_DAY_CHOICES, blank=True, default="")
     day_of_week = models.CharField(max_length=10, blank=True, default="")
     # Linkage field for serial crimes (analyst manually assigns a group label)
-    serial_group_label = models.CharField(max_length=100, blank=True, default="",
-                                          help_text="Group label linking serial cases, e.g. 'Mbare Burglar 2024'")
-    created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL,
-                                   related_name="incidents_created")
+    serial_group_label = models.CharField(max_length=100, blank=True, default="",help_text="Group label linking serial cases, e.g. 'Mbare Burglar 2024'")
+    created_by = models.ForeignKey(CustomUser, null=True, blank=True, on_delete=models.SET_NULL,related_name="incidents_created")
     updated_at = models.DateTimeField(auto_now=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
