@@ -33,7 +33,7 @@ Admin only
 """
 from __future__ import annotations
 
-import logging
+from loguru import logger
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -67,8 +67,6 @@ from .serializers import (
     TimeSeriesRequestSerializer,
     UserSerializer,
 )
-
-logger = logging.getLogger(__name__)
 
 
 # =============================================================================
