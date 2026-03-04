@@ -136,19 +136,17 @@ STATIC_URL = 'static/'
 
 # ─── CORS (for React dashboard at separate origin) ─────────────────────────────
 CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",       # React dev server
-    "https://your-dashboard.com",  # Production React URL
+    "http://localhost:5173",
+    "http://localhost:5174"
 ]
-CORS_ALLOW_CREDENTIALS = True
 
 # ─── Django REST Framework ──────────────────────────────────────────────────────
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
-        "rest_framework.authentication.TokenAuthentication",
+        "rest_framework_simplejwt.authentication.JWTAuthentication",
         "rest_framework.authentication.SessionAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": [
-        # Public endpoints override this with AllowAny in the view
         "rest_framework.permissions.IsAuthenticated",
     ],
     "DEFAULT_RENDERER_CLASSES": [

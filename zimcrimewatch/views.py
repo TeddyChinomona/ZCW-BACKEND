@@ -80,11 +80,11 @@ def _parse_date_range(request) -> tuple[datetime | None, datetime | None]:
     end   = request.query_params.get("end_date")
     try:
         start_dt = (
-            datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=timezone.UTC)
             if start else None
         )
         end_dt = (
-            datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=timezone.UTC)
             + timedelta(days=1)
             if end else None
         )
@@ -185,7 +185,7 @@ class LoginView(APIView):
                     "role":             user.role,
                 },
             },
-            status=status.HTTP_200_OK,
+            status.HTTP_200_OK,
         )
 
 

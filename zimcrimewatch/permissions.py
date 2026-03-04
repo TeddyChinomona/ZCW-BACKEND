@@ -11,7 +11,7 @@ class IsZRPAuthenticated(IsAuthenticated):
     def has_permission(self, request, view):
         return (
             super().has_permission(request, view)
-            and hasattr(request.user, "zrp_profile")
+            and hasattr(request.user, "role")
         )
 
 
@@ -21,8 +21,8 @@ class IsZRPAdmin(IsAuthenticated):
     def has_permission(self, request, view):
         return (
             super().has_permission(request, view)
-            and hasattr(request.user, "zrp_profile")
-            and request.user.zrp_profile.role == "admin"
+            and hasattr(request.user, "role")
+            and request.user == "admin"
         )
 
 
@@ -32,9 +32,9 @@ class IsZRPAnalystOrAdmin(IsAuthenticated):
     def has_permission(self, request, view):
         if not super().has_permission(request, view):
             return False
-        if not hasattr(request.user, "zrp_profile"):
+        if not hasattr(request.user, "role"):
             return False
-        role = request.user.zrp_profile.role
+        role = request.user.role
         if request.method in ("GET", "HEAD", "OPTIONS"):
             return True  # all ZRP roles can read
         return role in ("analyst", "admin")
