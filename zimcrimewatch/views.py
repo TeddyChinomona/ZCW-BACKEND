@@ -96,7 +96,7 @@ def _parse_date_range(request) -> tuple[datetime | None, datetime | None]:
 def _filter_incidents(request, qs=None):
     """Apply common query filters (crime_type, date range, suburb, status)."""
     if qs is None:
-        qs = CrimeIncident.objects.select_related("crime_type", "created_by")
+        qs = CrimeIncident.objects
 
     crime_type_id = request.query_params.get("crime_type_id")
     suburb        = request.query_params.get("suburb", "").strip()
@@ -632,7 +632,7 @@ class TimeSeriesView(APIView):
         if df.empty:
             return Response({"timeseries": []})
 
-        result = compute_time_series(df, freq=d.get("freq", "W"))
+        result = compute_time_series(df, d.get("freq", "W"))
         return Response({"timeseries": result})
 
     def get(self, request):
@@ -648,6 +648,7 @@ class HotspotView(APIView):
 
     def _run(self, request):
         qs = _filter_incidents(request).exclude(location__isnull=True)
+        
         coords = [
             (inc.location.y, inc.location.x)
             for inc in qs.only("location")
@@ -655,7 +656,7 @@ class HotspotView(APIView):
         ]
         if not coords:
             return Response({"hotspots": []})
-        result = compute_hotspot_summary(coords)
+        result = compute_hotspot_summary(coords, ['THEFT'], [])
         return Response({"hotspots": result})
 
     def get(self, request):
