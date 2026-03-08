@@ -183,8 +183,8 @@ def aggregate_case_features(df: pd.DataFrame) -> pd.DataFrame:
 # ===========================================================================
 
 def build_pairwise_similarity_matrix(agg_df: pd.DataFrame,
-                                     tfidf: Optional[TfidfVectorizer] = None
-                                     ) -> tuple[np.ndarray, TfidfVectorizer]:
+    tfidf: Optional[TfidfVectorizer] = None
+) -> tuple[np.ndarray, TfidfVectorizer]:
     """
     Build an (N × N) weighted composite similarity matrix.
 
@@ -650,174 +650,174 @@ class SerialCrimeLinkageModel:
         return instance.link_probability(case_a, case_b)
 
 
-# ===========================================================================
-#  Standalone Demo / Self-Test
-# ===========================================================================
+# # ===========================================================================
+# #  Standalone Demo / Self-Test
+# # ===========================================================================
 
-if __name__ == "__main__":
-    import os
+# if __name__ == "__main__":
+#     import os
 
-    # -----------------------------------------------------------------------
-    # Load dataset
-    # -----------------------------------------------------------------------
-    csv_path = Path(__file__).parent / "dataset1.csv"
-    if csv_path.exists():
-        df_raw = pd.read_csv(csv_path, on_bad_lines="skip")
-        print(f"✓ Loaded dataset1.csv  ({len(df_raw)} rows, "
-              f"{df_raw['case_number'].nunique()} unique cases)\n")
-    else:
-        # Synthetic fallback dataset
-        print("dataset1.csv not found — using synthetic data\n")
-        df_raw = pd.DataFrame({
-            "case_number":   [1,1,2,2,3,4,4,5,6,7,8,9,10,10],
-            "date_received": ["01/01/24"]*4 + ["03/01/24"]*4 + ["05/01/24"]*6,
-            "time_received": ["0900h","0900h","0910h","0910h","1400h","1405h",
-                              "1405h","0855h","0856h","0857h","0858h","0859h","1200hs","1200hs"],
-            "complainant_name": ["Alice","Bob","Eve","Frank","Carol","Dave","Gina",
-                                 "Unknown","Unknown","Unknown","Unknown","Unknown","Han","Ivy"],
-            "sex":    ["F","M","F","M","F","M","F","M","F","M","F","M","F","M"],
-            "age":    [25,45,27,43,30,28,32,60,22,55,21,44,29,47],
-            "residential_address": ["Highlands","Highlands","Highlands",
-                                    "Highlands","Belvedere","Belvedere",
-                                    "Belvedere","Mbare","Mbare","Mbare",
-                                    "Avondale","Avondale","CBD","CBD"],
-            "incident_location": ["College Bar","College Bar","College Bar",
-                                   "College Bar","Shop A","Shop A","Shop A",
-                                   None,None,None,None,None,"Market","Market"],
-            "property_stolen_description": [
-                "Cellphone Tablet","Cellphone Tablet","Cellphone","Tablet",
-                "Burglar Bar","Burglar Bar","Burglar Bar broken window",
-                None,None,None,None,None,"Cash","Cash wallet"],
-        })
+#     # -----------------------------------------------------------------------
+#     # Load dataset
+#     # -----------------------------------------------------------------------
+#     csv_path = Path(__file__).parent / "dataset1.csv"
+#     if csv_path.exists():
+#         df_raw = pd.read_csv(csv_path, on_bad_lines="skip")
+#         print(f"✓ Loaded dataset1.csv  ({len(df_raw)} rows, "
+#               f"{df_raw['case_number'].nunique()} unique cases)\n")
+#     else:
+#         # Synthetic fallback dataset
+#         print("dataset1.csv not found — using synthetic data\n")
+#         df_raw = pd.DataFrame({
+#             "case_number":   [1,1,2,2,3,4,4,5,6,7,8,9,10,10],
+#             "date_received": ["01/01/24"]*4 + ["03/01/24"]*4 + ["05/01/24"]*6,
+#             "time_received": ["0900h","0900h","0910h","0910h","1400h","1405h",
+#                               "1405h","0855h","0856h","0857h","0858h","0859h","1200hs","1200hs"],
+#             "complainant_name": ["Alice","Bob","Eve","Frank","Carol","Dave","Gina",
+#                                  "Unknown","Unknown","Unknown","Unknown","Unknown","Han","Ivy"],
+#             "sex":    ["F","M","F","M","F","M","F","M","F","M","F","M","F","M"],
+#             "age":    [25,45,27,43,30,28,32,60,22,55,21,44,29,47],
+#             "residential_address": ["Highlands","Highlands","Highlands",
+#                                     "Highlands","Belvedere","Belvedere",
+#                                     "Belvedere","Mbare","Mbare","Mbare",
+#                                     "Avondale","Avondale","CBD","CBD"],
+#             "incident_location": ["College Bar","College Bar","College Bar",
+#                                    "College Bar","Shop A","Shop A","Shop A",
+#                                    None,None,None,None,None,"Market","Market"],
+#             "property_stolen_description": [
+#                 "Cellphone Tablet","Cellphone Tablet","Cellphone","Tablet",
+#                 "Burglar Bar","Burglar Bar","Burglar Bar broken window",
+#                 None,None,None,None,None,"Cash","Cash wallet"],
+#         })
 
-    # -----------------------------------------------------------------------
-    # 1. Unsupervised clustering
-    # -----------------------------------------------------------------------
-    print("=" * 60)
-    print(" STAGE 1: Unsupervised Serial Crime Clustering")
-    print("=" * 60)
-    model = SerialCrimeLinkageModel()
-    results = model.train_unsupervised(df_raw)
+#     # -----------------------------------------------------------------------
+#     # 1. Unsupervised clustering
+#     # -----------------------------------------------------------------------
+#     print("=" * 60)
+#     print(" STAGE 1: Unsupervised Serial Crime Clustering")
+#     print("=" * 60)
+#     model = SerialCrimeLinkageModel()
+#     results = model.train_unsupervised(df_raw)
 
-    print(f"\n  Cases analysed      : {results['n_cases']}")
-    print(f"  Serial clusters found: {results['n_serial_clusters']}")
-    print(f"  Unlinked (noise)     : {results['n_unlinked_cases']}")
-    if results.get("silhouette_score") is not None:
-        print(f"  Silhouette score     : {results['silhouette_score']}")
+#     print(f"\n  Cases analysed      : {results['n_cases']}")
+#     print(f"  Serial clusters found: {results['n_serial_clusters']}")
+#     print(f"  Unlinked (noise)     : {results['n_unlinked_cases']}")
+#     if results.get("silhouette_score") is not None:
+#         print(f"  Silhouette score     : {results['silhouette_score']}")
 
-    if results["clusters"]:
-        print("\n  Cluster Details:")
-        for c in results["clusters"]:
-            print(f"    [{c['label']}]  {c['n_cases']} cases → "
-                  f"cases {c['case_numbers']}  "
-                  f"(avg similarity: {c['mean_intra_similarity']})")
+#     if results["clusters"]:
+#         print("\n  Cluster Details:")
+#         for c in results["clusters"]:
+#             print(f"    [{c['label']}]  {c['n_cases']} cases → "
+#                   f"cases {c['case_numbers']}  "
+#                   f"(avg similarity: {c['mean_intra_similarity']})")
 
-    # -----------------------------------------------------------------------
-    # 2. Full clustered DataFrame
-    # -----------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print(" STAGE 2: Case-Level Cluster Assignments")
-    print("=" * 60)
-    clustered_df = model.cluster_cases(df_raw)
-    display_cols = ["case_number", "cluster_label", "max_similarity_score",
-                    "most_similar_case", "mean_age", "pct_female", "date_ord"]
-    print(clustered_df[[c for c in display_cols if c in clustered_df.columns]].to_string(index=False))
+#     # -----------------------------------------------------------------------
+#     # 2. Full clustered DataFrame
+#     # -----------------------------------------------------------------------
+#     print("\n" + "=" * 60)
+#     print(" STAGE 2: Case-Level Cluster Assignments")
+#     print("=" * 60)
+#     clustered_df = model.cluster_cases(df_raw)
+#     display_cols = ["case_number", "cluster_label", "max_similarity_score",
+#                     "most_similar_case", "mean_age", "pct_female", "date_ord"]
+#     print(clustered_df[[c for c in display_cols if c in clustered_df.columns]].to_string(index=False))
 
-    # -----------------------------------------------------------------------
-    # 3. Pairwise linkage probability
-    # -----------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print(" STAGE 3: Pairwise Linkage Assessment")
-    print("=" * 60)
+#     # -----------------------------------------------------------------------
+#     # 3. Pairwise linkage probability
+#     # -----------------------------------------------------------------------
+#     print("\n" + "=" * 60)
+#     print(" STAGE 3: Pairwise Linkage Assessment")
+#     print("=" * 60)
 
-    agg = model.agg_df_
-    if len(agg) >= 2:
-        for (i, j) in [(0, 1), (0, len(agg) - 1)]:
-            row_a = agg.iloc[i]
-            row_b = agg.iloc[j]
-            case_a_dict = {
-                "date_ord": row_a["date_ord"],
-                "time_min": row_a["time_min"],
-                "mean_age": row_a["mean_age"],
-                "pct_female": row_a["pct_female"],
-                "pct_male": row_a["pct_male"],
-                "full_location": row_a["full_location"],
-                "mo_text": row_a["mo_text"],
-            }
-            case_b_dict = {
-                "date_ord": row_b["date_ord"],
-                "time_min": row_b["time_min"],
-                "mean_age": row_b["mean_age"],
-                "pct_female": row_b["pct_female"],
-                "pct_male": row_b["pct_male"],
-                "full_location": row_b["full_location"],
-                "mo_text": row_b["mo_text"],
-            }
-            result = model.link_probability(case_a_dict, case_b_dict)
-            print(f"\n  Case {int(row_a['case_number'])} ←→ Case {int(row_b['case_number'])}")
-            print(f"    Link Probability : {result['link_probability']:.1%}")
-            print(f"    Verdict          : {result['verdict']}")
-            print(f"    Feature Scores   :")
-            for feat, score in result["feature_scores"].items():
-                score_val = score if not (isinstance(score, float) and np.isnan(score)) else 0.0
-                bar = "█" * int(score_val * 20)
-                print(f"      {feat:<25} {score_val:.3f}  {bar}")
+#     agg = model.agg_df_
+#     if len(agg) >= 2:
+#         for (i, j) in [(0, 1), (0, len(agg) - 1)]:
+#             row_a = agg.iloc[i]
+#             row_b = agg.iloc[j]
+#             case_a_dict = {
+#                 "date_ord": row_a["date_ord"],
+#                 "time_min": row_a["time_min"],
+#                 "mean_age": row_a["mean_age"],
+#                 "pct_female": row_a["pct_female"],
+#                 "pct_male": row_a["pct_male"],
+#                 "full_location": row_a["full_location"],
+#                 "mo_text": row_a["mo_text"],
+#             }
+#             case_b_dict = {
+#                 "date_ord": row_b["date_ord"],
+#                 "time_min": row_b["time_min"],
+#                 "mean_age": row_b["mean_age"],
+#                 "pct_female": row_b["pct_female"],
+#                 "pct_male": row_b["pct_male"],
+#                 "full_location": row_b["full_location"],
+#                 "mo_text": row_b["mo_text"],
+#             }
+#             result = model.link_probability(case_a_dict, case_b_dict)
+#             print(f"\n  Case {int(row_a['case_number'])} ←→ Case {int(row_b['case_number'])}")
+#             print(f"    Link Probability : {result['link_probability']:.1%}")
+#             print(f"    Verdict          : {result['verdict']}")
+#             print(f"    Feature Scores   :")
+#             for feat, score in result["feature_scores"].items():
+#                 score_val = score if not (isinstance(score, float) and np.isnan(score)) else 0.0
+#                 bar = "█" * int(score_val * 20)
+#                 print(f"      {feat:<25} {score_val:.3f}  {bar}")
 
-    # -----------------------------------------------------------------------
-    # 4. Synthetic supervised demo (auto-generated labels)
-    # -----------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print(" STAGE 4: Supervised Training Demo (synthetic labels)")
-    print("=" * 60)
-    n = len(agg)
-    if n >= 4:
-        pairs_X = []
-        pairs_y = []
-        for i in range(n):
-            for j in range(i + 1, n):
-                composite = float(model.sim_matrix_[i, j])
-                row_a = agg.iloc[i]
-                row_b = agg.iloc[j]
-                # Temporal
-                d_a = row_a["date_ord"] or 0.0
-                d_b = row_b["date_ord"] or 0.0
-                t_a = row_a["time_min"] or 720.0
-                t_b = row_b["time_min"] or 720.0
-                date_sim = 1.0 - min(abs(d_a - d_b) / 30.0, 1.0)
-                time_sim = 1.0 - min(abs(t_a - t_b) / 720.0, 1.0)
-                temporal = 0.6 * date_sim + 0.4 * time_sim
-                spatial = _location_similarity(row_a["full_location"], row_b["full_location"])
-                if model.tfidf:
-                    vecs = model.tfidf.transform([row_a["mo_text"] or "", row_b["mo_text"] or ""]).toarray()
-                    mo_s = float(cosine_similarity([vecs[0]], [vecs[1]])[0, 0])
-                else:
-                    mo_s = 0.5
-                age_diff = abs((row_a["mean_age"] or 35) - (row_b["mean_age"] or 35))
-                age_s = float(np.exp(-(age_diff ** 2) / 200))
-                gender_s = 1.0 - 0.5 * (abs(row_a["pct_female"] - row_b["pct_female"]) +
-                                         abs(row_a["pct_male"] - row_b["pct_male"]))
-                pairs_X.append([temporal, spatial, mo_s, age_s, gender_s])
-                # Auto-label: linked if same cluster and cluster != -1
-                ca = model.cluster_labels_[i]
-                cb = model.cluster_labels_[j]
-                pairs_y.append(1 if (ca == cb and ca != -1) else 0)
+#     # -----------------------------------------------------------------------
+#     # 4. Synthetic supervised demo (auto-generated labels)
+#     # -----------------------------------------------------------------------
+#     print("\n" + "=" * 60)
+#     print(" STAGE 4: Supervised Training Demo (synthetic labels)")
+#     print("=" * 60)
+#     n = len(agg)
+#     if n >= 4:
+#         pairs_X = []
+#         pairs_y = []
+#         for i in range(n):
+#             for j in range(i + 1, n):
+#                 composite = float(model.sim_matrix_[i, j])
+#                 row_a = agg.iloc[i]
+#                 row_b = agg.iloc[j]
+#                 # Temporal
+#                 d_a = row_a["date_ord"] or 0.0
+#                 d_b = row_b["date_ord"] or 0.0
+#                 t_a = row_a["time_min"] or 720.0
+#                 t_b = row_b["time_min"] or 720.0
+#                 date_sim = 1.0 - min(abs(d_a - d_b) / 30.0, 1.0)
+#                 time_sim = 1.0 - min(abs(t_a - t_b) / 720.0, 1.0)
+#                 temporal = 0.6 * date_sim + 0.4 * time_sim
+#                 spatial = _location_similarity(row_a["full_location"], row_b["full_location"])
+#                 if model.tfidf:
+#                     vecs = model.tfidf.transform([row_a["mo_text"] or "", row_b["mo_text"] or ""]).toarray()
+#                     mo_s = float(cosine_similarity([vecs[0]], [vecs[1]])[0, 0])
+#                 else:
+#                     mo_s = 0.5
+#                 age_diff = abs((row_a["mean_age"] or 35) - (row_b["mean_age"] or 35))
+#                 age_s = float(np.exp(-(age_diff ** 2) / 200))
+#                 gender_s = 1.0 - 0.5 * (abs(row_a["pct_female"] - row_b["pct_female"]) +
+#                                          abs(row_a["pct_male"] - row_b["pct_male"]))
+#                 pairs_X.append([temporal, spatial, mo_s, age_s, gender_s])
+#                 # Auto-label: linked if same cluster and cluster != -1
+#                 ca = model.cluster_labels_[i]
+#                 cb = model.cluster_labels_[j]
+#                 pairs_y.append(1 if (ca == cb and ca != -1) else 0)
 
-        X_arr = np.array(pairs_X)
-        y_arr = np.array(pairs_y)
+#         X_arr = np.array(pairs_X)
+#         y_arr = np.array(pairs_y)
 
-        print(f"  Generated {len(y_arr)} pairs  "
-              f"({y_arr.sum()} linked, {(~y_arr.astype(bool)).sum()} unlinked)")
+#         print(f"  Generated {len(y_arr)} pairs  "
+#               f"({y_arr.sum()} linked, {(~y_arr.astype(bool)).sum()} unlinked)")
 
-        if y_arr.sum() >= 2 and (~y_arr.astype(bool)).sum() >= 2:
-            sup_results = model.train_supervised(X_arr, y_arr)
-            if "error" not in sup_results:
-                print(f"  CV ROC-AUC : {sup_results['cv_roc_auc_mean']:.4f} "
-                      f"(±{sup_results['cv_roc_auc_std']:.4f})")
-                print("  Weights used: temporal=0.20, spatial=0.25, mo=0.25, age=0.15, gender=0.15")
-            else:
-                print(f"  Supervised skipped: {sup_results['error']}")
-        else:
-            print("  Supervised training skipped: need both linked & unlinked pairs")
+#         if y_arr.sum() >= 2 and (~y_arr.astype(bool)).sum() >= 2:
+#             sup_results = model.train_supervised(X_arr, y_arr)
+#             if "error" not in sup_results:
+#                 print(f"  CV ROC-AUC : {sup_results['cv_roc_auc_mean']:.4f} "
+#                       f"(±{sup_results['cv_roc_auc_std']:.4f})")
+#                 print("  Weights used: temporal=0.20, spatial=0.25, mo=0.25, age=0.15, gender=0.15")
+#             else:
+#                 print(f"  Supervised skipped: {sup_results['error']}")
+#         else:
+#             print("  Supervised training skipped: need both linked & unlinked pairs")
 
-    print("\n✓ Serial Crime Linkage Model — self-test complete.")
-    print(f"  Model saved → {MODEL_PATH}")
+#     print("\n✓ Serial Crime Linkage Model — self-test complete.")
+#     print(f"  Model saved → {MODEL_PATH}")
