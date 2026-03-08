@@ -1,5 +1,8 @@
 """
-ZimCrimeWatch - URL Configuration
+zimcrimewatch/urls.py
+=====================
+ZimCrimeWatch — URL Configuration
+
 Maps all API endpoints to their corresponding APIView classes.
 
 Auth endpoints summary
@@ -7,6 +10,12 @@ Auth endpoints summary
 POST  api/public/auth/login/          LoginView        — get access + refresh tokens
 POST  api/public/auth/token/refresh/  TokenRefreshView — exchange refresh → new access
 POST  api/public/auth/logout/         LogoutView       — blacklist refresh token
+
+Serial Crime Linkage endpoints  ← NEW
+--------------------------------------
+POST  api/zrp/analytics/serial-linkage/train/            — train DBSCAN cluster model
+POST  api/zrp/analytics/serial-linkage/cluster/          — get cluster assignments
+POST  api/zrp/analytics/serial-linkage/link-probability/ — pairwise link probability
 """
 from django.urls import path
 from . import views
@@ -61,6 +70,7 @@ urlpatterns = [
         views.IncidentDetailView.as_view(),
         name="incident-detail",
     ),
+    # ProfileMatcher similar-cases endpoint — uses the fixed find_similar()
     path(
         "zrp/incidents/<int:pk>/similar/",
         views.IncidentSimilarCasesView.as_view(),
@@ -115,6 +125,32 @@ urlpatterns = [
     ),
 
     # ──────────────────────────────────────────────────────────────────────────
+    # Serial Crime Linkage  ← NEW
+    # Integrates serial_crime_linkage.py into the backend API.
+    # ──────────────────────────────────────────────────────────────────────────
+
+    # Train the DBSCAN serial-linkage model on all current incidents.
+    path(
+        "zrp/analytics/serial-linkage/train/",
+        views.SerialLinkageTrainView.as_view(),
+        name="serial-linkage-train",
+    ),
+
+    # Return cluster assignments for all incidents (or a filtered subset).
+    path(
+        "zrp/analytics/serial-linkage/cluster/",
+        views.SerialLinkageClusterView.as_view(),
+        name="serial-linkage-cluster",
+    ),
+
+    # Compute pairwise link probability between two specific incidents.
+    path(
+        "zrp/analytics/serial-linkage/link-probability/",
+        views.SerialLinkageProbabilityView.as_view(),
+        name="serial-linkage-probability",
+    ),
+
+    # ──────────────────────────────────────────────────────────────────────────
     # Admin — User management
     # ──────────────────────────────────────────────────────────────────────────
     path(
@@ -129,7 +165,8 @@ urlpatterns = [
     ),
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Admin — ML model training trigger
+    # Admin — ML model training trigger  (ProfileMatcher only)
+    # For serial linkage training use /analytics/serial-linkage/train/ instead.
     # ──────────────────────────────────────────────────────────────────────────
     path(
         "zrp/ml/train/",
