@@ -18,7 +18,8 @@ POST  api/zrp/analytics/serial-linkage/cluster/          — get cluster assignm
 POST  api/zrp/analytics/serial-linkage/link-probability/ — pairwise link probability
 """
 from django.urls import path
-from . import views
+from . import (views, csv_upload_view)  # Import views and the new CSV upload view
+
 
 app_name = "zimcrimewatch"
 
@@ -172,5 +173,21 @@ urlpatterns = [
         "zrp/ml/train/",
         views.MLTrainView.as_view(),
         name="ml-train",
+    ),
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Admin — Bulk CSV data upload  (fulfils ADM-03 requirement)
+    # ──────────────────────────────────────────────────────────────────────────
+    # POST  /api/zrp/data/upload-csv/
+    #
+    # Accepts multipart/form-data with one field:
+    #   file  — a .csv matching the zimcrime_watch_dataset schema
+    #
+    # Returns: { "created": N, "skipped": N, "errors": [...] }
+    # ──────────────────────────────────────────────────────────────────────────
+    path(
+        "zrp/data/upload-csv/",
+        csv_upload_view.CSVUploadView.as_view(),
+        name="data-upload-csv",
     ),
 ]

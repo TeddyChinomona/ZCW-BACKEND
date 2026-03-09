@@ -634,6 +634,7 @@ class SerialCrimeLinkageModel:
                 "Serial linkage model not found. Run train_unsupervised() first."
             )
         with open(MODEL_PATH, "rb") as f:
+            logger.info("SerialCrimeLinkageModel loaded from %s", MODEL_PATH)
             return pickle.load(f)
 
     @classmethod

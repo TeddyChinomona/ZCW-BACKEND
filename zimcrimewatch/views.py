@@ -43,6 +43,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 import pandas as pd
+import numpy as np
+from .serial_crime_linkage import SerialCrimeLinkageModel
 from django.contrib.auth import authenticate
 from django.db.models import Count, Q
 from django.utils import timezone
@@ -634,62 +636,196 @@ class HotspotView(APIView):
         return self._run(request)
 
 
+# =============================================================================
+# ZRP Analytics — Profile Match  (replace existing ProfileMatchView in views.py)
+# =============================================================================
+#
+# Extra import needed at the top of views.py (if not already present):
+#   from .serial_crime_linkage import SerialCrimeLinkageModel
+#   import numpy as np
+#
+# Fallback strategy
+# -----------------
+#   1. Try ProfileMatcher (RandomForest, supervised).
+#      Fast path — loads the pre-trained .pkl and calls find_similar().
+#
+#   2. If ProfileMatcher model file is missing, fall back to
+#      SerialCrimeLinkageModel (DBSCAN, unsupervised):
+#        a. Load the pre-trained serial linkage .pkl.
+#        b. Locate the query incident's row in the stored agg_df_ by case_number.
+#        c. Read that row's column in sim_matrix_ to get similarity scores
+#           to every other case.
+#        d. Sort descending, take the top_n case_numbers (excluding self).
+#        e. Resolve those case_numbers back to CrimeIncident PKs.
+#
+#   3. If neither model file exists, return 503 with clear instructions.
+#
+# Response shape
+# --------------
+# Both paths return the same envelope so the frontend needs no changes:
+#   {
+#     "query_incident": <int>,
+#     "model_used":     "supervised" | "unsupervised",
+#     "matches":        [ <CrimeIncidentSerializer> … ]
+#   }
+#
+# The extra "model_used" key lets the frontend show a subtle badge
+# ("Profile Match" vs "Similarity-Based Match") without changing any
+# existing logic.
+
+import numpy as np  # add to top-of-file imports if not already present
+from .serial_crime_linkage import SerialCrimeLinkageModel  # add to top-of-file imports
+
+
 class ProfileMatchView(APIView):
     """
     POST /api/zrp/analytics/profile-match/
-    Body: { "incident_id": <int>, "top_n": <int, optional> }
-    Returns the top_n most similar incidents for the given incident_id.
+    Body: { "incident_id": <int>, "top_n": <int, optional, default 5> }
+
+    Returns the top_n most similar incidents using:
+      • ProfileMatcher (RandomForest)       when supervised model is trained
+      • SerialCrimeLinkageModel (DBSCAN)    as fallback when no supervised model
     """
     permission_classes = [IsZRPAnalystOrAdmin]
 
     def post(self, request):
+        # ── Validate request body ─────────────────────────────────────────────
         serializer = ProfileMatchRequestSerializer(data=request.data)
         if not serializer.is_valid():
-            return Response(
-                serializer.errors, status=status.HTTP_400_BAD_REQUEST
-            )
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+        incident_id = serializer.validated_data["incident_id"]
+        top_n       = serializer.validated_data.get("top_n", 5)
+
+        # ── Resolve the query incident ────────────────────────────────────────
         try:
-            incident = CrimeIncident.objects.get(
-                pk=serializer.validated_data["incident_id"]
-            )
+            incident = CrimeIncident.objects.select_related("crime_type").get(pk=incident_id)
         except CrimeIncident.DoesNotExist:
             return Response(
                 {"detail": "Incident not found."},
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        top_n   = serializer.validated_data.get("top_n", 5)
+        # ── Path 1: Supervised — ProfileMatcher (RandomForest) ────────────────
         matcher = ProfileMatcher()
         try:
             similar_ids = matcher.find_similar(incident, top_n=top_n)
+
+            similar_qs = CrimeIncident.objects.filter(
+                pk__in=similar_ids
+            ).select_related("crime_type")
+
+            return Response(
+                {
+                    "query_incident": incident_id,
+                    "model_used":     "supervised",
+                    "matches":        CrimeIncidentSerializer(similar_qs, many=True).data,
+                },
+                status=status.HTTP_200_OK,
+            )
+
         except FileNotFoundError:
+            # Supervised model not trained yet — fall through to unsupervised
+            logger.info(
+                "ProfileMatchView: supervised model not found for incident %d — "
+                "trying SerialCrimeLinkageModel fallback.",
+                incident_id,
+            )
+
+        except Exception as exc:
+            # Unexpected error in supervised path — log and fall through
+            logger.warning(
+                "ProfileMatchView: supervised match failed for incident %d (%s) — "
+                "trying SerialCrimeLinkageModel fallback.",
+                incident_id, exc,
+            )
+
+        # ── Path 2: Unsupervised fallback — SerialCrimeLinkageModel ──────────
+        try:
+            linkage_model = SerialCrimeLinkageModel.load()
+        except FileNotFoundError:
+            # Neither model is available — tell the user clearly
             return Response(
                 {
                     "detail": (
-                        "Profile matching model not trained yet. "
-                        "Run: python manage.py train_profile_matcher"
+                        "No trained model is available. "
+                        "Go to the ML Training page and click 'Train Model Now' "
+                        "to train before using profile matching."
                     )
                 },
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
-        except Exception as exc:
-            logger.error("ProfileMatcher error: %s", exc)
+
+        # The linkage model's agg_df_ holds one row per unique case_number.
+        # We locate the query case by its case_number (string), then use its
+        # row index to read the correct column from the similarity matrix.
+        agg_df     = linkage_model.agg_df_
+        sim_matrix = linkage_model.sim_matrix_
+
+        if agg_df is None or sim_matrix is None:
             return Response(
-                {"detail": "Profile matching unavailable."},
+                {
+                    "detail": (
+                        "Serial linkage model is present but was not fitted. "
+                        "Please re-train the model from the ML Training page."
+                    )
+                },
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
 
+        # Find the row index in agg_df that matches the query incident's case_number
+        matches_mask = agg_df["case_number"] == incident.case_number
+        if not matches_mask.any():
+            # The query incident is not in the model's training set.
+            # This happens when the incident was added after the last training run.
+            return Response(
+                {
+                    "detail": (
+                        f"Incident '{incident.case_number}' was not included in the "
+                        "last training run. Re-train the model to include it, then retry."
+                    )
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # Get the index position of the query incident in the matrix
+        query_idx = int(matches_mask.idxmax())
+
+        # Read the query incident's similarity row from the N×N matrix.
+        # This gives us a 1-D array of similarity scores against every other case.
+        sim_row = sim_matrix[query_idx].copy()
+
+        # Exclude the query incident itself (similarity = 1.0 with itself)
+        sim_row[query_idx] = -1.0
+
+        # Sort descending and take the top_n indices
+        top_indices = np.argsort(sim_row)[::-1][:top_n]
+
+        # Map matrix indices → case_number strings stored in agg_df
+        top_case_numbers = agg_df.iloc[top_indices]["case_number"].tolist()
+
+        # Resolve case_numbers → CrimeIncident PKs for the serializer.
+        # We use __in on case_number since agg_df stores strings, not PKs.
         similar_qs = CrimeIncident.objects.filter(
-            pk__in=similar_ids
+            case_number__in=top_case_numbers
         ).select_related("crime_type")
-        return Response(
-            {
-                "query_incident": serializer.validated_data["incident_id"],
-                "matches":        CrimeIncidentSerializer(similar_qs, many=True).data,
-            }
+
+        # Preserve the similarity-score ordering from the matrix in the response.
+        # Django's __in query does not guarantee order, so we re-sort manually.
+        order_map = {cn: rank for rank, cn in enumerate(top_case_numbers)}
+        similar_incidents = sorted(
+            similar_qs,
+            key=lambda inc: order_map.get(inc.case_number, 999),
         )
 
+        return Response(
+            {
+                "query_incident": incident_id,
+                "model_used":     "unsupervised",
+                "matches":        CrimeIncidentSerializer(similar_incidents, many=True).data,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 # =============================================================================
 # Serial Crime Linkage  ← NEW  (integrates serial_crime_linkage.py)
@@ -941,51 +1077,143 @@ class SerialLinkageProbabilityView(APIView):
 
 
 # =============================================================================
-# Admin — ML training trigger (ProfileMatcher)
+# Admin — ML training trigger  (replace the existing MLTrainView in views.py)
 # =============================================================================
+#
+# Import addition needed at the top of views.py:
+#   from .serial_crime_linkage import SerialCrimeLinkageModel
+#   import pandas as pd   ← already present
+#
+# Field mapping: CrimeIncident → SerialCrimeLinkageModel column names
+# ─────────────────────────────────────────────────────────────────────
+# CrimeIncident field       SerialCrimeLinkageModel expects
+# ─────────────────────     ───────────────────────────────
+# case_number               case_number            (same)
+# timestamp (date part)     date_received
+# timestamp (time part)     time_received
+# description_narrative     complainant_name       (closest available)
+# status                    sex                    (placeholder — not in model)
+# num_suspects              age                    (placeholder — not in model)
+# suburb                    residential_address
+# suburb                    incident_location      (same — best available)
+# modus_operandi            property_stolen_description
+
+from .serial_crime_linkage import SerialCrimeLinkageModel   # add to imports at top of views.py
+
 
 class MLTrainView(APIView):
     """
     POST /api/zrp/ml/train/
-    Re-train the RandomForest ProfileMatcher model.
-    Requires admin role.
+
+    Dual-mode training:
+      • Supervised   — ProfileMatcher (RandomForest) when labelled incidents exist
+                       (serial_group_label is non-empty)
+      • Unsupervised — SerialCrimeLinkageModel (DBSCAN) fallback when no labels
+
+    The `mode` key in the response tells the frontend which path was taken.
     """
     permission_classes = [IsZRPAdmin]
 
     def post(self, request):
-        # Use labelled incidents (those with a serial_group_label) for training.
-        qs = CrimeIncident.objects.exclude(serial_group_label="").select_related(
-            "crime_type"
+
+        # ── Step 1: Check for labelled incidents ──────────────────────────────
+        labelled_qs = CrimeIncident.objects.exclude(
+            serial_group_label__in=["", None]
+        ).select_related("crime_type")
+
+        has_labels = labelled_qs.exists()
+
+        # ── Step 2a: SUPERVISED — ProfileMatcher (RandomForest) ───────────────
+        if has_labels:
+            logger.info(
+                "MLTrainView: %d labelled incidents — training ProfileMatcher (supervised).",
+                labelled_qs.count(),
+            )
+            matcher = ProfileMatcher()
+            try:
+                metrics = matcher.train(labelled_qs)
+            except Exception as exc:
+                logger.error("MLTrainView supervised training failed: %s", exc)
+                return Response(
+                    {"detail": f"Supervised training failed: {exc}"},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+
+            if "error" in metrics:
+                return Response({"detail": metrics["error"]}, status=status.HTTP_400_BAD_REQUEST)
+
+            return Response({"mode": "supervised", **metrics}, status=status.HTTP_200_OK)
+
+        # ── Step 2b: UNSUPERVISED — SerialCrimeLinkageModel (DBSCAN) ─────────
+        logger.info(
+            "MLTrainView: No labelled incidents — "
+            "falling back to SerialCrimeLinkageModel (unsupervised DBSCAN)."
         )
-        if not qs.exists():
+
+        # Fetch only the fields that exist on CrimeIncident
+        all_qs = CrimeIncident.objects.all()
+
+        if not all_qs.exists():
             return Response(
-                {
-                    "detail": (
-                        "No labelled incidents found. "
-                        "Set 'serial_group_label' on incidents before training."
-                    )
-                },
+                {"detail": "No incident data found. Add incidents before training."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        matcher = ProfileMatcher()
+        # Pull the real CrimeIncident fields we have available
+        raw_data = list(all_qs.values(
+            "case_number",
+            "timestamp",           # datetime → split into date + time below
+            "description_narrative",
+            "num_suspects",
+            "suburb",
+            "modus_operandi",
+            "status",
+        ))
+
+        # Build a DataFrame and rename/derive columns to match the names
+        # that SerialCrimeLinkageModel.train_unsupervised() expects internally:
+        #   case_number, date_received, time_received, complainant_name,
+        #   sex, age, residential_address, incident_location,
+        #   property_stolen_description
+        df = pd.DataFrame(raw_data)
+
+        # Split the single timestamp into separate date and time strings
+        # SerialCrimeLinkageModel parses these with its own _parse_time_to_minutes helper
+        df["date_received"] = pd.to_datetime(df["timestamp"]).dt.strftime("%Y-%m-%d")
+        df["time_received"] = pd.to_datetime(df["timestamp"]).dt.strftime("%H%M")  # e.g. "1430"
+
+        # Map remaining fields to the names the linkage model expects.
+        # We use the best available approximations since the RRB complainant
+        # fields are not stored on CrimeIncident.
+        df["complainant_name"]            = df["description_narrative"].fillna("")
+        df["sex"]                         = ""          # not collected at this level
+        df["age"]                         = df["num_suspects"].fillna(0)
+        df["residential_address"]         = df["suburb"].fillna("")
+        df["incident_location"]           = df["suburb"].fillna("")
+        df["property_stolen_description"] = df["modus_operandi"].fillna("")
+
+        # Drop the original columns that have been mapped above —
+        # train_unsupervised() only looks at the renamed columns
+        df = df.drop(columns=["timestamp", "description_narrative",
+                               "num_suspects", "modus_operandi", "status"])
+
+        linkage_model = SerialCrimeLinkageModel()
         try:
-            metrics = matcher.train(qs)
+            # Call train_unsupervised directly with our pre-built DataFrame,
+            # bypassing train_unsupervised_from_queryset which has hardcoded
+            # field names that don't exist on CrimeIncident.
+            metrics = linkage_model.train_unsupervised(df)
         except Exception as exc:
-            logger.error("MLTrainView training failed: %s", exc)
+            logger.error("MLTrainView unsupervised training failed: %s", exc)
             return Response(
-                {"detail": f"Training failed: {exc}"},
+                {"detail": f"Unsupervised training failed: {exc}"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
         if "error" in metrics:
-            return Response(
-                {"detail": metrics["error"]},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            return Response({"detail": metrics["error"]}, status=status.HTTP_400_BAD_REQUEST)
 
-        return Response(metrics, status=status.HTTP_200_OK)
-
+        return Response({"mode": "unsupervised", **metrics}, status=status.HTTP_200_OK)
 
 # =============================================================================
 # Admin — User management

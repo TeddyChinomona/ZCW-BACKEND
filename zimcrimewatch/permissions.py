@@ -22,7 +22,7 @@ class IsZRPAdmin(IsAuthenticated):
         return (
             super().has_permission(request, view)
             and hasattr(request.user, "role")
-            and request.user == "admin"
+            and request.user.role == "admin"
         )
 
 
