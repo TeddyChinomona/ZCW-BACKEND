@@ -1,3 +1,6 @@
 {
-  "start": "gunicorn ZWC_BACKEND.wsgi"
+  "$schema": "https://schema.railpack.com",
+  "deploy": {
+    "startCommand": "gunicorn ZWC_BACKEND.wsgi"
+  }
 }
