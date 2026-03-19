@@ -1,51 +1,42 @@
 """
-serial_crime_linkage.py  —  ZIM CRIME WATCH
-============================================================
-Serial Crime Linkage Model
+serial_crime_linkage.py  —  ZimCrimeWatch Serial Crime Linkage Model
+=====================================================================
 
 PURPOSE
 -------
-Determines the likelihood that two or more crimes were committed by the
-same person or group (a "serial offender") by computing a composite
-similarity score across five dimensions:
+Figures out whether multiple crimes were committed by the same person
+(a "serial offender") by scoring how similar pairs of crimes are across
+five dimensions:
 
-  1. TEMPORAL    – how close in date & time the crimes occurred
-  2. SPATIAL     – how similar the incident/residential locations are
-  3. MODUS OPERANDI – how similar the stolen-property descriptions are
-                    (TF-IDF cosine similarity on free text)
-  4. COMPLAINANT AGE    – proximity in victim age profiles
-  5. COMPLAINANT GENDER – proportion of gender overlap across victims
+  1. TEMPORAL    — how close together the crimes happened in date & time
+  2. SPATIAL     — how similar the crime locations are (Jaccard overlap)
+  3. MODUS OPERANDI (MO) — how similar the stolen-property descriptions are
+                            (TF-IDF cosine similarity on free text)
+  4. VICTIM AGE  — how close the victims' ages are (Gaussian similarity)
+  5. VICTIM GENDER — how similar the gender profile of victims is
 
-The pairwise similarity matrix is then fed into:
-  • DBSCAN clustering  – fully unsupervised; groups crimes into serial
-                         clusters with no labelled data required.
-  • GradientBoosting   – supervised mode (once analysts label cases as
-                         linked/unlinked) for binary linkage prediction.
+Those five scores are combined into one composite similarity score per pair
+of cases, building an (N × N) similarity matrix across all N cases.
 
-ARCHITECTURE  (mirrors ProfileMatcher in ml_utils.py)
-------------------------------------------------------
-  SerialCrimeLinkageModel.train_unsupervised(df) → cluster assignments
-  SerialCrimeLinkageModel.train_supervised(df, labels) → GBT model
-  SerialCrimeLinkageModel.link_probability(case_a_dict, case_b_dict)
-      → float [0.0 – 1.0]  probability they share an offender
-  SerialCrimeLinkageModel.cluster_cases(df) → df with 'serial_cluster'
-  SerialCrimeLinkageModel.save() / .load()
+That matrix feeds into:
+  • DBSCAN clustering  — groups crimes into "serial clusters" with no labels needed
+  • GradientBoosting   — once analysts label pairs as linked/unlinked, this
+                          predicts the probability that two new cases are linked
 
-DJANGO INTEGRATION
-------------------
-Drop this file into  zimcrimewatch/serial_linkage.py
-Call from a management command:
-    from zimcrimewatch.serial_linkage import SerialCrimeLinkageModel
+HOW THE DATA IS STRUCTURED
+---------------------------
+The raw data has one row per complainant (victim), but multiple complainants
+can belong to the same criminal case. The case_number column ties them together.
+
+We first "aggregate" — collapsing all complainant rows for a case into a
+single case-level summary row — before computing similarities.
+
+DJANGO USAGE
+------------
+    from zimcrimewatch.serial_crime_linkage import SerialCrimeLinkageModel
     model = SerialCrimeLinkageModel()
     results = model.train_unsupervised_from_queryset(CrimeIncident.objects.all())
-
-STANDALONE DEMO
----------------
-Run:  python serial_crime_linkage.py
-      (uses the bundled synthetic dataset or dataset1.csv)
 """
-
-from __future__ import annotations
 
 import logging
 import pickle
@@ -53,14 +44,13 @@ import re
 import warnings
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import pandas as pd
 from sklearn.cluster import DBSCAN
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics import (classification_report, silhouette_score)
+from sklearn.metrics import classification_report, silhouette_score
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.model_selection import cross_val_score
 from sklearn.preprocessing import MinMaxScaler
@@ -69,108 +59,174 @@ warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Model persistence path (Django: adjust to settings.BASE_DIR / "ml_models")
-# ---------------------------------------------------------------------------
+# Path where the trained model is saved on disk (next to this file)
 MODEL_PATH = Path(__file__).parent / "serial_linkage_model.pkl"
 
 
-# ===========================================================================
-#  Feature Engineering Helpers
-# ===========================================================================
+# =============================================================================
+# Helper functions  —  small, focused utilities used by the main functions
+# =============================================================================
 
-def _parse_time_to_minutes(time_str) -> Optional[float]:
-    """Convert messy time strings like '0905h', '1200hs', '14:30' → minutes."""
+def _parse_time_to_minutes(time_str):
+    """
+    Convert a messy time string into minutes since midnight (a plain float).
+
+    Handles formats like: '0905h', '0905hs', '9:05', '14:30', '900'
+    Returns None if the string cannot be parsed.
+
+    Example:
+        _parse_time_to_minutes("0905h")  →  545.0   (9*60 + 5)
+        _parse_time_to_minutes("14:30")  →  870.0   (14*60 + 30)
+    """
     if pd.isna(time_str) or str(time_str).strip() == "":
         return None
-    s = str(time_str).strip().upper().replace("HS", "").replace("H", "")
-    s = s.replace(":", "")
+
+    # Strip trailing noise like "h", "hs", spaces; remove colons for uniform format
+    s = str(time_str).strip().upper().replace("HS", "").replace("H", "").replace(":", "")
+
     try:
+        # Remove any remaining non-digit characters
         s = re.sub(r"[^0-9]", "", s)
+
+        # Short strings like "9" or "14" are just hours
         if len(s) <= 2:
             return float(s) * 60
+
+        # Pad 3-digit strings like "905" → "0905"
         if len(s) == 3:
             s = "0" + s
-        h, m = int(s[:2]), int(s[2:4])
-        return float(h * 60 + m)
+
+        # Now s is 4+ digits: first 2 are hours, next 2 are minutes
+        hours = int(s[:2])
+        minutes = int(s[2:4])
+        return float(hours * 60 + minutes)
+
     except Exception:
         return None
 
 
-def _parse_date_to_ordinal(date_str) -> Optional[float]:
-    """Parse DD/MM/YY or DD/MM/YYYY strings → days since epoch."""
+def _parse_date_to_ordinal(date_str):
+    """
+    Convert a date string into an ordinal number (days since year 0001).
+
+    Using ordinal numbers lets us subtract dates to get "days apart".
+
+    Handles: 'DD/MM/YY', 'DD/MM/YYYY', 'YYYY-MM-DD'
+    Returns None if the string cannot be parsed.
+    """
     if pd.isna(date_str) or str(date_str).strip() == "":
         return None
+
+    # Try each format until one works
     for fmt in ("%d/%m/%y", "%d/%m/%Y", "%Y-%m-%d"):
         try:
             return float(datetime.strptime(str(date_str).strip(), fmt).toordinal())
         except ValueError:
-            continue
-    return None
+            continue  # try next format
+
+    return None  # no format worked
 
 
-def _normalise_gender(val) -> Optional[str]:
-    if pd.isna(val):
+def _normalise_gender(value):
+    """
+    Standardise gender strings to 'M', 'F', or None.
+    Handles: 'male', 'MALE', 'M', 'female', 'FEMALE', 'F'
+    """
+    if pd.isna(value):
         return None
-    v = str(val).strip().upper()
+    v = str(value).strip().upper()
     if v in ("M", "MALE"):
         return "M"
     if v in ("F", "FEMALE"):
         return "F"
-    return None
+    return None  # unknown / other
 
 
-def _location_similarity(loc_a: str, loc_b: str) -> float:
+def _location_similarity(loc_a, loc_b):
     """
-    Simple token-overlap Jaccard similarity between two address strings.
-    Upgraded to TF-IDF cosine when > 100 cases are available.
+    Measure how similar two address strings are using Jaccard similarity.
+
+    Jaccard similarity = (words in common) / (total unique words in both).
+    Example:
+        "Highlands Harare" vs "Highlands CBD"
+        intersection = {"highlands"}, union = {"highlands", "harare", "cbd"}
+        similarity = 1/3 ≈ 0.33
+
+    Returns 0.5 (neutral) if either location is missing.
+    Returns values between 0 (no overlap) and 1 (identical).
     """
     if not loc_a or not loc_b:
-        return 0.5  # unknown → neutral
-    tokens_a = set(re.sub(r"[^a-z0-9 ]", "", loc_a.lower()).split())
-    tokens_b = set(re.sub(r"[^a-z0-9 ]", "", loc_b.lower()).split())
+        return 0.5  # unknown location → neutral score, not zero
+
+    # Lowercase and keep only letters, digits, and spaces
+    clean_a = re.sub(r"[^a-z0-9 ]", "", loc_a.lower())
+    clean_b = re.sub(r"[^a-z0-9 ]", "", loc_b.lower())
+
+    tokens_a = set(clean_a.split())
+    tokens_b = set(clean_b.split())
+
     if not tokens_a or not tokens_b:
         return 0.5
-    intersection = tokens_a & tokens_b
-    union = tokens_a | tokens_b
+
+    intersection = tokens_a & tokens_b   # words in both
+    union = tokens_a | tokens_b          # all unique words
+
     return len(intersection) / len(union)
 
 
-# ===========================================================================
-#  Case-Level Feature Aggregation
-#  (one crime case → multiple complainants in dataset → aggregate)
-# ===========================================================================
+# =============================================================================
+# Case-Level Feature Aggregation
+# "Collapse multiple victim rows per case into one summary row"
+# =============================================================================
 
-def aggregate_case_features(df: pd.DataFrame) -> pd.DataFrame:
+def aggregate_case_features(df):
     """
-    Collapse multiple complainant rows per case_number into a single
-    case-level feature row with aggregate statistics.
+    The raw data can have multiple complainant rows per case_number.
+    This function collapses them into one row per case with summary statistics.
 
-    Returns a DataFrame with one row per unique case.
+    Input columns needed:
+        case_number, date_received, time_received, complainant_name,
+        sex, age, residential_address, incident_location,
+        property_stolen_description
+
+    Output: one row per unique case_number with aggregated features.
     """
     df = df.copy()
 
-    # Normalise gender column
+    # Convert raw columns to numeric formats we can do maths on
     df["sex_norm"] = df["sex"].apply(_normalise_gender)
     df["date_ord"] = df["date_received"].apply(_parse_date_to_ordinal)
     df["time_min"] = df["time_received"].apply(_parse_time_to_minutes)
 
+    # Group all complainant rows by case_number and compute one summary per case
     agg = df.groupby("case_number").agg(
+        # Use the date/time of the first recorded complainant as the case date/time
         date_ord=("date_ord", "first"),
         time_min=("time_min", "first"),
+
+        # Average and range of victim ages across the case
         mean_age=("age", "mean"),
         age_range=("age", lambda x: x.max() - x.min() if x.notna().sum() > 0 else 0),
+
+        # Count how many complainants there were
         n_complainants=("complainant_name", "count"),
+
+        # Proportion of female and male victims (values between 0 and 1)
         pct_female=("sex_norm", lambda x: (x == "F").sum() / max(x.notna().sum(), 1)),
         pct_male=("sex_norm", lambda x: (x == "M").sum() / max(x.notna().sum(), 1)),
-        location=("residential_address", lambda x: " ".join(x.dropna().astype(str).unique())),
+
+        # Combine all unique location strings into one text blob for comparison
+        location=("residential_address",
+                  lambda x: " ".join(x.dropna().astype(str).unique())),
         incident_location=("incident_location",
                            lambda x: " ".join(x.dropna().astype(str).unique())),
+
+        # Combine all stolen property descriptions into one text blob
         mo_text=("property_stolen_description",
                  lambda x: " ".join(x.dropna().astype(str).unique())),
     ).reset_index()
 
-    # Merge location fields for MO proxy
+    # Merge the two location fields into one combined text for similarity matching
     agg["full_location"] = (
         agg["location"].fillna("") + " " + agg["incident_location"].fillna("")
     ).str.strip()
@@ -178,78 +234,100 @@ def aggregate_case_features(df: pd.DataFrame) -> pd.DataFrame:
     return agg
 
 
-# ===========================================================================
-#  Pairwise Similarity Matrix
-# ===========================================================================
+# =============================================================================
+# Pairwise Similarity Matrix
+# "Score every pair of cases across all five similarity dimensions"
+# =============================================================================
 
-def build_pairwise_similarity_matrix(agg_df: pd.DataFrame,
-    tfidf: Optional[TfidfVectorizer] = None
-) -> tuple[np.ndarray, TfidfVectorizer]:
+def build_pairwise_similarity_matrix(agg_df, tfidf=None):
     """
-    Build an (N × N) weighted composite similarity matrix.
+    Build an (N × N) matrix where entry [i, j] is the composite similarity
+    score between case i and case j.  The matrix is symmetric (sim[i,j] == sim[j,i])
+    and has 1.0 on the diagonal (a case is perfectly similar to itself).
 
-    Weights (tunable — reflect investigative importance):
-      temporal   : 0.20
-      spatial    : 0.25
-      MO text    : 0.25
-      victim age : 0.15
-      victim sex : 0.15
+    The five component scores are weighted and summed:
+      Temporal   × 0.20
+      Spatial    × 0.25
+      MO text    × 0.25
+      Victim age × 0.15
+      Gender     × 0.15
+      ─────────────────
+      Total       1.00
+
+    Parameters:
+        agg_df : DataFrame produced by aggregate_case_features()
+        tfidf  : an already-fitted TfidfVectorizer (pass None to fit a new one)
+
+    Returns:
+        (similarity_matrix, tfidf_vectorizer)
     """
     n = len(agg_df)
-    sim = np.zeros((n, n))
 
-    # --- MO TF-IDF --------------------------------------------------------
+    # ---- Fit TF-IDF on modus operandi text if not already fitted -----------
     if tfidf is None:
-        tfidf = TfidfVectorizer(max_features=200, ngram_range=(1, 2),
-                                stop_words="english")
-    mo_matrix = tfidf.fit_transform(agg_df["mo_text"].fillna("unknown")).toarray()
-    mo_cos = cosine_similarity(mo_matrix)  # (N, N)
+        tfidf = TfidfVectorizer(max_features=500, ngram_range=(1, 2))
 
-    # --- Temporal distance ------------------------------------------------
-    scaler_time = MinMaxScaler()
-    dates = agg_df["date_ord"].values.reshape(-1, 1)
-    times = agg_df["time_min"].values.reshape(-1, 1)
+    # Encode all MO texts into TF-IDF vectors (one row per case)
+    mo_texts = agg_df["mo_text"].fillna("").tolist()
+    mo_matrix = tfidf.fit_transform(mo_texts)
 
-    # Fill NaN with column mean before scaling
-    date_filled = np.where(np.isnan(dates), np.nanmean(dates), dates)
-    time_filled = np.where(np.isnan(times), np.nanmean(times), times)
+    # Compute cosine similarity between all pairs of MO text vectors at once.
+    # Result is an (N × N) matrix where mo_cos[i, j] is the text similarity.
+    mo_cos = cosine_similarity(mo_matrix)
 
-    dates_norm = scaler_time.fit_transform(date_filled).flatten()
-    scaler_t2 = MinMaxScaler()
-    times_norm = scaler_t2.fit_transform(time_filled).flatten()
+    # ---- Extract numeric columns for the other similarity dimensions --------
+    locations = agg_df["full_location"].fillna("").tolist()
 
-    # --- Numeric victim features ------------------------------------------
-    ages = agg_df["mean_age"].fillna(agg_df["mean_age"].mean()).values
+    # Fill missing numeric values with reasonable defaults
+    ages = agg_df["mean_age"].fillna(agg_df["mean_age"].median()).values
     pct_f = agg_df["pct_female"].fillna(0.5).values
     pct_m = agg_df["pct_male"].fillna(0.5).values
-    locations = agg_df["full_location"].fillna("").values
+
+    # Normalise date and time to [0, 1] range using MinMaxScaler,
+    # so that temporal differences are on a comparable scale to other features.
+    scaler = MinMaxScaler()
+    dates_raw = agg_df["date_ord"].fillna(agg_df["date_ord"].median()).values.reshape(-1, 1)
+    times_raw = agg_df["time_min"].fillna(720.0).values.reshape(-1, 1)  # default noon
+    dates_norm = scaler.fit_transform(dates_raw).flatten()
+    times_norm = scaler.fit_transform(times_raw).flatten()
+
+    # ---- Compute the composite similarity for every pair (i, j) ------------
+    # We use an (N × N) matrix initialised to zeros, then fill it.
+    sim = np.zeros((n, n), dtype=float)
+    np.fill_diagonal(sim, 1.0)  # each case is 100% similar to itself
 
     for i in range(n):
-        for j in range(i, n):
-            if i == j:
-                sim[i, j] = 1.0
-                continue
+        for j in range(i + 1, n):  # only upper triangle; we'll mirror it
 
-            # 1. Temporal similarity  (1 − normalised absolute diff)
-            date_sim = 1.0 - abs(dates_norm[i] - dates_norm[j])
-            time_sim = 1.0 - abs(times_norm[i] - times_norm[j])
-            temporal = (date_sim * 0.6 + time_sim * 0.4)
+            # 1. Temporal similarity: 1 minus normalised date difference,
+            #    blended 60/40 with time-of-day similarity.
+            date_diff = abs(dates_norm[i] - dates_norm[j])
+            time_diff = abs(times_norm[i] - times_norm[j])
+            temporal = 0.6 * (1.0 - date_diff) + 0.4 * (1.0 - time_diff)
 
-            # 2. Spatial similarity
+            # 2. Spatial similarity: Jaccard token overlap of location strings
             spatial = _location_similarity(locations[i], locations[j])
 
-            # 3. Modus Operandi (TF-IDF cosine)
+            # 3. MO text similarity: already computed above in the full matrix
             mo_s = float(mo_cos[i, j])
 
-            # 4. Victim age proximity  (Gaussian decay: σ = 10 years)
+            # 4. Victim age similarity: Gaussian function of age difference.
+            #    np.exp(-(diff²) / (2 * σ²)) with σ=10 years:
+            #    - Same age      → similarity 1.0
+            #    - 10 years apart → similarity ~0.61
+            #    - 20 years apart → similarity ~0.14
             age_diff = abs(ages[i] - ages[j])
             age_s = float(np.exp(-(age_diff ** 2) / (2 * 10 ** 2)))
 
-            # 5. Victim gender profile overlap
-            gender_s = 1.0 - 0.5 * (abs(pct_f[i] - pct_f[j]) +
-                                     abs(pct_m[i] - pct_m[j]))
+            # 5. Gender profile similarity: 1 minus the average absolute
+            #    difference in female% and male% between the two cases.
+            #    If both cases have 100% female victims, score = 1.0.
+            gender_s = 1.0 - 0.5 * (
+                abs(pct_f[i] - pct_f[j]) +
+                abs(pct_m[i] - pct_m[j])
+            )
 
-            # Weighted composite
+            # Weighted composite score
             composite = (
                 0.20 * temporal +
                 0.25 * spatial +
@@ -257,48 +335,34 @@ def build_pairwise_similarity_matrix(agg_df: pd.DataFrame,
                 0.15 * age_s +
                 0.15 * gender_s
             )
+
+            # Fill both sides of the symmetric matrix
             sim[i, j] = composite
             sim[j, i] = composite
 
     return sim, tfidf
 
 
-# ===========================================================================
-#  Serial Crime Linkage Model Class
-# ===========================================================================
+# =============================================================================
+# Main Model Class
+# =============================================================================
 
 class SerialCrimeLinkageModel:
     """
-    Main model class — mirrors ProfileMatcher in ml_utils.py.
+    The main class that ties everything together.
 
-    Modes
-    -----
-    unsupervised  : DBSCAN clusters cases by composite similarity.
-                    No labels required — works from day one.
+    Two modes:
+      unsupervised — DBSCAN clusters crimes by similarity, no labels needed.
+      supervised   — GradientBoosting predicts whether two cases are linked,
+                     once analysts have labelled some pairs as linked/unlinked.
 
-    supervised    : GradientBoostingClassifier predicts link probability
-                    between a pair of cases once analysts provide labels.
-
-    Usage (unsupervised)
-    --------------------
-    model = SerialCrimeLinkageModel()
-    results = model.train_unsupervised(df)       # df = raw CSV or ORM data
-    clustered = model.cluster_cases(df)          # returns df + 'serial_cluster'
-
-    Usage (supervised — after labelling)
-    -------------------------------------
-    model = SerialCrimeLinkageModel()
-    model.train_supervised(pair_df, link_labels)
-    prob = model.link_probability(case_a_features, case_b_features)
-
-    Django Management Command Integration
-    --------------------------------------
-    results = model.train_unsupervised_from_queryset(
-        CrimeIncident.objects.all()
-    )
+    Quick usage:
+        model = SerialCrimeLinkageModel()
+        results = model.train_unsupervised(df)
+        clustered_df = model.cluster_cases(df)
     """
 
-    # Similarity weights — exposed for tuning
+    # ---- Configuration: weights and DBSCAN tuning parameters ---------------
     WEIGHTS = {
         "temporal": 0.20,
         "spatial":  0.25,
@@ -307,71 +371,101 @@ class SerialCrimeLinkageModel:
         "gender":   0.15,
     }
 
-    # DBSCAN params — eps is in similarity space (0–1), 1−eps = max distance
-    DBSCAN_EPS = 0.35          # cases closer than 0.35 distance are neighbours
-    DBSCAN_MIN_SAMPLES = 2     # minimum 2 crimes to form a serial cluster
+    # DBSCAN eps is the maximum *distance* (= 1 - similarity) allowed between
+    # two neighbouring points. eps=0.35 means cases must have similarity >= 0.65
+    # to be considered neighbours.
+    DBSCAN_EPS = 0.35
+
+    # Minimum number of cases required to form a serial cluster
+    DBSCAN_MIN_SAMPLES = 2
 
     def __init__(self):
-        self.tfidf: Optional[TfidfVectorizer] = None
-        self.gbt: Optional[GradientBoostingClassifier] = None
-        self.scaler: Optional[MinMaxScaler] = None
-        self.sim_matrix_: Optional[np.ndarray] = None
-        self.agg_df_: Optional[pd.DataFrame] = None
-        self.cluster_labels_: Optional[np.ndarray] = None
-        self._is_supervised = False
-        self._training_metrics: dict = {}
+        self.tfidf = None              # TfidfVectorizer fitted during training
+        self.gbt = None                # GradientBoostingClassifier (supervised mode)
+        self.scaler = None             # MinMaxScaler for supervised feature scaling
+        self.sim_matrix_ = None        # The (N × N) similarity matrix
+        self.agg_df_ = None            # Case-level aggregated features
+        self.cluster_labels_ = None    # DBSCAN cluster assignment per case (-1 = noise)
+        self._is_supervised = False    # True once train_supervised() has been called
+        self._training_metrics = {}    # Summary stats from the last training run
 
-    # ------------------------------------------------------------------
-    # PUBLIC API  — Unsupervised
-    # ------------------------------------------------------------------
+    # =========================================================================
+    # PUBLIC API — Unsupervised Mode
+    # =========================================================================
 
-    def train_unsupervised(self, df: pd.DataFrame) -> dict:
+    def train_unsupervised(self, df):
         """
-        Full unsupervised pipeline:
-          1. Aggregate complainant rows → case rows
-          2. Build pairwise similarity matrix
-          3. DBSCAN cluster cases
+        Full unsupervised pipeline on a raw DataFrame:
+          Step 1: Aggregate multiple complainant rows → one row per case
+          Step 2: Build the (N × N) pairwise similarity matrix
+          Step 3: Run DBSCAN on (1 - similarity) as a distance matrix
 
-        Returns dict with cluster summary.
+        Parameters:
+            df : DataFrame with columns: case_number, date_received,
+                 time_received, complainant_name, sex, age,
+                 residential_address, incident_location,
+                 property_stolen_description
+
+        Returns:
+            dict with summary statistics and cluster details
         """
-        logger.info("Aggregating %d rows into case-level features …", len(df))
+        logger.info("Aggregating %d complainant rows into case-level features...", len(df))
         self.agg_df_ = aggregate_case_features(df)
         n = len(self.agg_df_)
 
         if n < 2:
             return {"error": "Need at least 2 cases to perform linkage analysis."}
 
-        logger.info("Building %d×%d pairwise similarity matrix …", n, n)
+        logger.info("Building %d × %d pairwise similarity matrix...", n, n)
         self.sim_matrix_, self.tfidf = build_pairwise_similarity_matrix(
             self.agg_df_, self.tfidf
         )
 
-        # DBSCAN operates on *distance* matrix (1 − similarity)
+        # ---- Convert similarity to distance for DBSCAN ----------------------
+        # DBSCAN needs a *distance* matrix (small = close), but we have a
+        # *similarity* matrix (large = close).  Distance = 1 - similarity.
         distance_matrix = 1.0 - self.sim_matrix_
+
+        # Set the diagonal to exactly 0.0 (a case has zero distance to itself)
         np.fill_diagonal(distance_matrix, 0.0)
+
+        # Clip to [0, 1] to remove any tiny floating-point negatives
         distance_matrix = np.clip(distance_matrix, 0, 1)
 
-        logger.info("Running DBSCAN (eps=%.2f, min_samples=%d) …",
-                    self.DBSCAN_EPS, self.DBSCAN_MIN_SAMPLES)
+        logger.info(
+            "Running DBSCAN (eps=%.2f, min_samples=%d)...",
+            self.DBSCAN_EPS, self.DBSCAN_MIN_SAMPLES
+        )
+
+        # metric="precomputed" tells DBSCAN we are providing a distance matrix
+        # rather than raw data points
         dbscan = DBSCAN(
             eps=self.DBSCAN_EPS,
             min_samples=self.DBSCAN_MIN_SAMPLES,
             metric="precomputed",
         )
+        # fit_predict returns an array of cluster labels, one per case.
+        # -1 means the case did not fit into any cluster ("noise").
         self.cluster_labels_ = dbscan.fit_predict(distance_matrix)
 
-        # Silhouette score (only meaningful if > 1 cluster found)
-        n_clusters = len(set(self.cluster_labels_)) - (1 if -1 in self.cluster_labels_ else 0)
+        # ---- Count clusters and compute quality score -----------------------
+        # The set of unique labels minus -1 gives the number of real clusters
+        unique_labels = set(self.cluster_labels_)
+        n_clusters = len(unique_labels) - (1 if -1 in unique_labels else 0)
+
+        # Silhouette score: measures how well-separated the clusters are.
+        # Ranges from -1 (bad) to 1 (great). Only meaningful if > 1 cluster found.
         sil_score = None
         if n_clusters > 1 and n > n_clusters:
             try:
                 sil_score = round(float(silhouette_score(
-                    distance_matrix, self.cluster_labels_, metric="precomputed"
+                    distance_matrix,
+                    self.cluster_labels_,
+                    metric="precomputed",
                 )), 4)
             except Exception:
-                pass
+                pass  # silhouette can fail in edge cases; that's fine
 
-        # Build summary
         cluster_summary = self._build_cluster_summary()
 
         self._training_metrics = {
@@ -382,199 +476,44 @@ class SerialCrimeLinkageModel:
             "silhouette_score": sil_score,
             "clusters": cluster_summary,
         }
+
         self._save()
         logger.info("Model saved. %d serial cluster(s) found.", n_clusters)
         return self._training_metrics
 
-    def cluster_cases(self, df: pd.DataFrame) -> pd.DataFrame:
+    def cluster_cases(self, df):
         """
-        Returns the aggregated case DataFrame enriched with:
-          serial_cluster  : int   (-1 = no link found, 0,1,2… = serial group)
-          max_similarity  : float (highest similarity to any case in same cluster)
-          linked_cases    : list  (case_number of most similar cases)
-        """
-        results = self.train_unsupervised(df)
-        if "error" in results:
-            raise ValueError(results["error"])
+        Add a 'serial_cluster' column to the DataFrame using the trained model.
+        Cases with cluster label -1 are noise (no serial link found).
 
-        out = self.agg_df_.copy()
-        out["serial_cluster"] = self.cluster_labels_
-        out["cluster_label"] = out["serial_cluster"].apply(
-            lambda c: f"Serial Group {c}" if c >= 0 else "Unlinked"
-        )
-
-        # For each case find its most similar neighbour
-        n = len(out)
-        max_sims, linked = [], []
-        for i in range(n):
-            row_sim = self.sim_matrix_[i].copy()
-            row_sim[i] = 0.0          # exclude self
-            best_j = int(np.argmax(row_sim))
-            max_sims.append(round(float(row_sim[best_j]), 4))
-            linked.append(int(out.iloc[best_j]["case_number"]))
-
-        out["max_similarity_score"] = max_sims
-        out["most_similar_case"] = linked
-        return out
-
-    # ------------------------------------------------------------------
-    # PUBLIC API  — Supervised
-    # ------------------------------------------------------------------
-
-    def train_supervised(self, pair_features: np.ndarray,
-                         link_labels: np.ndarray) -> dict:
-        """
-        Train a GradientBoostingClassifier on labelled (case_A, case_B)
-        pairs.
-
-        pair_features : (N_pairs × 5) array — one row per pair with columns:
-            [temporal_sim, spatial_sim, mo_sim, age_sim, gender_sim]
-        link_labels   : (N_pairs,) int array — 1 = linked, 0 = unlinked
-
-        Returns training metrics dict.
-        """
-        if len(pair_features) < 10:
-            return {"error": "Need at least 10 labelled pairs to train."}
-
-        from sklearn.ensemble import HistGradientBoostingClassifier
-        from sklearn.impute import SimpleImputer
-
-        # Impute NaNs before scaling
-        imputer = SimpleImputer(strategy="mean")
-        X_imputed = imputer.fit_transform(pair_features)
-        self._imputer = imputer
-
-        self.scaler = MinMaxScaler()
-        X = self.scaler.fit_transform(X_imputed)
-        y = link_labels
-
-        # HistGBT natively handles NaNs and imbalanced data well
-        self.gbt = HistGradientBoostingClassifier(
-            max_iter=200,
-            learning_rate=0.05,
-            max_depth=4,
-            random_state=42,
-        )
-        cv_scores = cross_val_score(
-            self.gbt, X, y, cv=min(5, max(2, len(y) // 5)),
-            scoring="roc_auc"
-        )
-        self.gbt.fit(X, y)
-        self._is_supervised = True
-        self._training_metrics["supervised"] = {
-            "status": "trained_supervised",
-            "n_pairs": len(y),
-            "n_linked": int(y.sum()),
-            "cv_roc_auc_mean": round(float(cv_scores.mean()), 4),
-            "cv_roc_auc_std": round(float(cv_scores.std()), 4),
-        }
-        self._save()
-        return self._training_metrics["supervised"]
-
-    def link_probability(self,
-                         case_a: dict,
-                         case_b: dict) -> dict:
-        """
-        Compute linkage probability between two case feature dicts.
-
-        Each dict must contain:
-            date_ord        : float  (datetime.toordinal())
-            time_min        : float  (minutes since midnight, or None)
-            mean_age        : float  (average victim age)
-            pct_female      : float  (0.0 – 1.0)
-            pct_male        : float  (0.0 – 1.0)
-            full_location   : str
-            mo_text         : str
+        Parameters:
+            df : raw DataFrame (same format as train_unsupervised)
 
         Returns:
-            {
-              "composite_similarity": float,
-              "link_probability": float,   # GBT if available else similarity
-              "feature_scores": {...},
-              "verdict": str
-            }
+            df with an added 'serial_cluster' column
         """
-        # Temporal
-        d_a = case_a.get("date_ord") or 0.0
-        d_b = case_b.get("date_ord") or 0.0
-        t_a = case_a.get("time_min") or 720.0   # default noon
-        t_b = case_b.get("time_min") or 720.0
-        date_sim = 1.0 - min(abs(d_a - d_b) / max(30, 1), 1.0)  # normalise ~30 days
-        time_sim = 1.0 - min(abs(t_a - t_b) / 720.0, 1.0)
-        temporal = 0.6 * date_sim + 0.4 * time_sim
+        # If there are no clusters stored yet, retrain first
+        if self.cluster_labels_ is None or self.agg_df_ is None:
+            self.train_unsupervised(df)
 
-        # Spatial
-        spatial = _location_similarity(
-            case_a.get("full_location", ""),
-            case_b.get("full_location", "")
+        # Map case_number → cluster_label using the stored agg_df_
+        cluster_map = dict(
+            zip(self.agg_df_["case_number"], self.cluster_labels_)
         )
 
-        # MO TF-IDF
-        if self.tfidf is not None:
-            vecs = self.tfidf.transform([
-                case_a.get("mo_text", "") or "",
-                case_b.get("mo_text", "") or "",
-            ]).toarray()
-            mo_s = float(cosine_similarity([vecs[0]], [vecs[1]])[0, 0])
-        else:
-            mo_s = 0.5
+        # Aggregate the input df so we have one row per case, then map labels
+        agg = aggregate_case_features(df)
+        agg["serial_cluster"] = agg["case_number"].map(cluster_map).fillna(-1).astype(int)
+        return agg
 
-        # Age
-        age_diff = abs((case_a.get("mean_age") or 35) - (case_b.get("mean_age") or 35))
-        age_s = float(np.exp(-(age_diff ** 2) / (2 * 10 ** 2)))
-
-        # Gender
-        gender_s = 1.0 - 0.5 * (
-            abs((case_a.get("pct_female") or 0.5) - (case_b.get("pct_female") or 0.5)) +
-            abs((case_a.get("pct_male") or 0.5) - (case_b.get("pct_male") or 0.5))
-        )
-
-        feat = np.array([[temporal, spatial, mo_s, age_s, gender_s]])
-        feat = np.nan_to_num(feat, nan=0.5)
-        composite = float(np.dot(
-            feat[0],
-            [self.WEIGHTS["temporal"], self.WEIGHTS["spatial"],
-             self.WEIGHTS["mo_text"], self.WEIGHTS["age"], self.WEIGHTS["gender"]]
-        ))
-
-        # Use GBT if trained, else use composite similarity as probability
-        if self._is_supervised and self.gbt is not None and self.scaler is not None:
-            feat_imputed = self._imputer.transform(feat)
-            feat_scaled = self.scaler.transform(feat_imputed)
-            prob = float(self.gbt.predict_proba(feat_scaled)[0, 1])
-        else:
-            prob = composite
-
-        verdict = (
-            "HIGH – Likely same offender" if prob >= 0.70 else
-            "MODERATE – Possible link, investigate further" if prob >= 0.45 else
-            "LOW – Unlikely to be linked"
-        )
-
-        return {
-            "composite_similarity": round(composite, 4),
-            "link_probability": round(prob, 4),
-            "feature_scores": {
-                "temporal_similarity": round(temporal, 4),
-                "spatial_similarity": round(spatial, 4),
-                "mo_similarity": round(mo_s, 4),
-                "age_similarity": round(age_s, 4),
-                "gender_similarity": round(gender_s, 4),
-            },
-            "verdict": verdict,
-        }
-
-    # ------------------------------------------------------------------
-    # Django Integration Helper
-    # ------------------------------------------------------------------
-
-    def train_unsupervised_from_queryset(self, incidents_qs) -> dict:
+    def train_unsupervised_from_queryset(self, incidents_qs):
         """
-        Django-ready wrapper. Pass in a CrimeIncident QuerySet.
-        The queryset must expose at minimum:
+        Convenience method: pull data from a Django QuerySet and train.
+
+        The queryset must expose these fields:
             case_number, date_received, time_received, complainant_name,
             sex, age, residential_address, incident_location,
-            property_stolen_description (or modus_operandi)
+            property_stolen_description
         """
         data = list(incidents_qs.values(
             "case_number", "date_received", "time_received",
@@ -582,243 +521,270 @@ class SerialCrimeLinkageModel:
             "residential_address", "incident_location",
             "property_stolen_description",
         ))
+
         if not data:
-            return {"error": "Empty queryset."}
+            return {"error": "No data returned from queryset."}
+
         df = pd.DataFrame(data)
         return self.train_unsupervised(df)
 
-    # ------------------------------------------------------------------
-    # Cluster Summary Helper
-    # ------------------------------------------------------------------
+    # =========================================================================
+    # PUBLIC API — Supervised Mode
+    # =========================================================================
 
-    def _build_cluster_summary(self) -> list[dict]:
+    def train_supervised(self, pair_df, link_labels):
+        """
+        Train a GradientBoosting classifier to predict whether two cases
+        are linked to the same offender, using analyst-provided labels.
+
+        Parameters:
+            pair_df : DataFrame where each row has features for a PAIR of cases.
+                      Must have columns: temporal, spatial, mo_text, age, gender
+                      (the five component similarity scores for that pair).
+            link_labels : array-like of 1 (linked) or 0 (not linked) per row.
+
+        Returns:
+            dict with cross-validation accuracy metrics
+        """
+        feature_cols = ["temporal", "spatial", "mo_text", "age", "gender"]
+        X = pair_df[feature_cols].fillna(0.5).values
+
+        # Scale features to [0, 1] — GradientBoosting benefits from scaled input
+        self.scaler = MinMaxScaler()
+        X_scaled = self.scaler.fit_transform(X)
+
+        self.gbt = GradientBoostingClassifier(
+            n_estimators=100,
+            learning_rate=0.1,
+            max_depth=3,
+            random_state=42,
+        )
+
+        # Cross-validate to get honest accuracy estimate
+        cv_scores = cross_val_score(self.gbt, X_scaled, link_labels, cv=5, scoring="roc_auc")
+        self.gbt.fit(X_scaled, link_labels)
+        self._is_supervised = True
+
+        self._save()
+        logger.info(
+            "Supervised model trained. AUC: %.3f ± %.3f",
+            cv_scores.mean(), cv_scores.std()
+        )
+        return {
+            "status": "trained_supervised",
+            "cv_auc_mean": round(float(cv_scores.mean()), 4),
+            "cv_auc_std": round(float(cv_scores.std()), 4),
+            "n_pairs": len(pair_df),
+        }
+
+    def link_probability(self, case_a, case_b):
+        """
+        Compute how likely two cases share an offender.
+
+        Each case dict must have these keys:
+            date_ord      : float  (from datetime.toordinal())
+            time_min      : float  (minutes since midnight, or None)
+            mean_age      : float  (average victim age)
+            pct_female    : float  (0.0 to 1.0)
+            pct_male      : float  (0.0 to 1.0)
+            full_location : str    (combined address text)
+            mo_text       : str    (stolen property description)
+
+        Returns:
+            {
+              "composite_similarity": float,
+              "link_probability":     float,   # GBT score if trained, else composite
+              "feature_scores":       dict,    # the five individual scores
+              "verdict":              str      # human-readable conclusion
+            }
+        """
+        # ---- Compute the five individual similarity scores ------------------
+
+        # 1. Temporal: date similarity (60%) + time-of-day similarity (40%)
+        date_a = case_a.get("date_ord") or 0.0
+        date_b = case_b.get("date_ord") or 0.0
+        time_a = case_a.get("time_min") or 720.0  # default noon if missing
+        time_b = case_b.get("time_min") or 720.0
+
+        # Normalise date difference: 30 days apart → similarity ~0, same day → 1.0
+        date_sim = 1.0 - min(abs(date_a - date_b) / 30.0, 1.0)
+        # Normalise time difference: 720 minutes = 12 hours → similarity 0, same time → 1.0
+        time_sim = 1.0 - min(abs(time_a - time_b) / 720.0, 1.0)
+        temporal = 0.6 * date_sim + 0.4 * time_sim
+
+        # 2. Spatial: Jaccard token overlap of combined location strings
+        spatial = _location_similarity(
+            case_a.get("full_location", ""),
+            case_b.get("full_location", ""),
+        )
+
+        # 3. MO text: TF-IDF cosine similarity on stolen property descriptions
+        if self.tfidf is not None:
+            # Transform both texts using the already-fitted TF-IDF vocabulary
+            vecs = self.tfidf.transform([
+                case_a.get("mo_text", "") or "",
+                case_b.get("mo_text", "") or "",
+            ]).toarray()
+            # cosine_similarity returns (1×1) shaped result; [0,0] extracts the float
+            mo_s = float(cosine_similarity([vecs[0]], [vecs[1]])[0, 0])
+        else:
+            mo_s = 0.5  # neutral if no TF-IDF model available
+
+        # 4. Victim age: Gaussian decay with σ=10 years
+        age_a = case_a.get("mean_age") or 35
+        age_b = case_b.get("mean_age") or 35
+        age_diff = abs(age_a - age_b)
+        age_s = float(np.exp(-(age_diff ** 2) / (2 * 10 ** 2)))
+
+        # 5. Gender profile: 1 minus mean absolute difference in gender %
+        gender_s = 1.0 - 0.5 * (
+            abs((case_a.get("pct_female") or 0.5) - (case_b.get("pct_female") or 0.5)) +
+            abs((case_a.get("pct_male") or 0.5) - (case_b.get("pct_male") or 0.5))
+        )
+
+        # ---- Weighted composite score ---------------------------------------
+        feature_vec = np.array([[temporal, spatial, mo_s, age_s, gender_s]])
+        feature_vec = np.nan_to_num(feature_vec, nan=0.5)  # replace any NaN with 0.5
+
+        weights = [
+            self.WEIGHTS["temporal"],
+            self.WEIGHTS["spatial"],
+            self.WEIGHTS["mo_text"],
+            self.WEIGHTS["age"],
+            self.WEIGHTS["gender"],
+        ]
+        composite = float(np.dot(feature_vec[0], weights))
+
+        # ---- Use GBT if trained, else use composite as the probability ------
+        if self._is_supervised and self.gbt is not None and self.scaler is not None:
+            X_scaled = self.scaler.transform(feature_vec)
+            # predict_proba returns [[prob_class_0, prob_class_1]]
+            # index [0, 1] gives the probability that label = 1 (linked)
+            link_prob = float(self.gbt.predict_proba(X_scaled)[0, 1])
+        else:
+            link_prob = composite  # use composite as fallback probability
+
+        # ---- Human-readable verdict ----------------------------------------
+        if link_prob >= 0.75:
+            verdict = "High likelihood of serial linkage"
+        elif link_prob >= 0.50:
+            verdict = "Moderate likelihood — warrants investigation"
+        elif link_prob >= 0.30:
+            verdict = "Low likelihood — possible coincidence"
+        else:
+            verdict = "Unlikely to be linked"
+
+        return {
+            "composite_similarity": round(composite, 4),
+            "link_probability": round(link_prob, 4),
+            "feature_scores": {
+                "temporal": round(temporal, 4),
+                "spatial":  round(spatial, 4),
+                "mo_text":  round(mo_s, 4),
+                "age":      round(age_s, 4),
+                "gender":   round(gender_s, 4),
+            },
+            "verdict": verdict,
+        }
+
+    # =========================================================================
+    # Internal helpers
+    # =========================================================================
+
+    def _build_cluster_summary(self):
+        """
+        Build a human-readable summary for each DBSCAN cluster found,
+        including which cases are in it and how similar they are to each other.
+
+        Returns a list of dicts, sorted by cluster size (largest first).
+        """
         if self.cluster_labels_ is None or self.agg_df_ is None:
             return []
+
         summaries = []
         unique_clusters = sorted(set(self.cluster_labels_))
-        for c in unique_clusters:
-            if c == -1:
-                continue
-            mask = self.cluster_labels_ == c
-            cases = self.agg_df_[mask]["case_number"].tolist()
-            sim_vals = []
-            idxs = np.where(mask)[0]
-            for i in idxs:
-                for j in idxs:
-                    if i < j:
-                        sim_vals.append(self.sim_matrix_[i, j])
+
+        for cluster_id in unique_clusters:
+            if cluster_id == -1:
+                continue  # skip noise points
+
+            # Boolean mask: True for cases assigned to this cluster
+            in_cluster = self.cluster_labels_ == cluster_id
+            cluster_cases = self.agg_df_[in_cluster]["case_number"].tolist()
+
+            # Compute intra-cluster similarities (how similar are cases within the cluster?)
+            cluster_indices = np.where(in_cluster)[0]
+            intra_sims = []
+            for i in cluster_indices:
+                for j in cluster_indices:
+                    if i < j:  # only upper triangle to avoid counting each pair twice
+                        intra_sims.append(self.sim_matrix_[i, j])
+
+            if intra_sims:
+                mean_sim = round(float(np.mean(intra_sims)), 4)
+                min_sim  = round(float(np.min(intra_sims)), 4)
+            else:
+                mean_sim = 1.0  # only one case in cluster
+                min_sim  = 1.0
 
             summaries.append({
-                "cluster_id": int(c),
-                "label": f"Serial Group {c}",
-                "n_cases": int(mask.sum()),
-                "case_numbers": cases,
-                "mean_intra_similarity": round(float(np.mean(sim_vals)), 4) if sim_vals else 1.0,
-                "min_intra_similarity": round(float(np.min(sim_vals)), 4) if sim_vals else 1.0,
+                "cluster_id": int(cluster_id),
+                "label": f"Serial Group {cluster_id}",
+                "n_cases": int(in_cluster.sum()),
+                "case_numbers": cluster_cases,
+                "mean_intra_similarity": mean_sim,
+                "min_intra_similarity": min_sim,
             })
+
+        # Return largest clusters first
         return sorted(summaries, key=lambda x: x["n_cases"], reverse=True)
 
-    # ------------------------------------------------------------------
-    # Persistence
-    # ------------------------------------------------------------------
+    # =========================================================================
+    # Persistence  —  save and load the trained model
+    # =========================================================================
 
     def _save(self):
+        """
+        Save the entire model object to disk using pickle.
+        The saved file contains the trained DBSCAN results, TF-IDF vocabulary,
+        and GBT classifier (if trained) so nothing needs to be recomputed later.
+        """
         with open(MODEL_PATH, "wb") as f:
             pickle.dump(self, f)
-        logger.info("SerialCrimeLinkageModel saved → %s", MODEL_PATH)
+        logger.info("SerialCrimeLinkageModel saved to %s", MODEL_PATH)
 
     @classmethod
-    def load(cls) -> "SerialCrimeLinkageModel":
+    def load(cls):
+        """
+        Load a previously saved model from disk.
+        Raises FileNotFoundError if train_unsupervised() has never been run.
+        """
         if not MODEL_PATH.exists():
             raise FileNotFoundError(
                 "Serial linkage model not found. Run train_unsupervised() first."
             )
         with open(MODEL_PATH, "rb") as f:
-            logger.info("SerialCrimeLinkageModel loaded from %s", MODEL_PATH)
-            return pickle.load(f)
+            instance = pickle.load(f)
+        logger.info("SerialCrimeLinkageModel loaded from %s", MODEL_PATH)
+        return instance
 
     @classmethod
-    def load_and_cluster(cls, df: pd.DataFrame) -> pd.DataFrame:
+    def load_and_cluster(cls, df):
+        """
+        Convenience method: load a saved model and cluster a new DataFrame.
+        If no saved model exists, trains a new one on the provided data.
+        """
         try:
             instance = cls.load()
         except FileNotFoundError:
-            instance = cls()
+            instance = cls()  # create fresh model and train below
         return instance.cluster_cases(df)
 
     @classmethod
-    def load_and_link(cls, case_a: dict, case_b: dict) -> dict:
+    def load_and_link(cls, case_a, case_b):
+        """
+        Convenience method: load a saved model and compute link probability
+        between two case dicts.
+        """
         instance = cls.load()
         return instance.link_probability(case_a, case_b)
-
-
-# # ===========================================================================
-# #  Standalone Demo / Self-Test
-# # ===========================================================================
-
-# if __name__ == "__main__":
-#     import os
-
-#     # -----------------------------------------------------------------------
-#     # Load dataset
-#     # -----------------------------------------------------------------------
-#     csv_path = Path(__file__).parent / "dataset1.csv"
-#     if csv_path.exists():
-#         df_raw = pd.read_csv(csv_path, on_bad_lines="skip")
-#         print(f"✓ Loaded dataset1.csv  ({len(df_raw)} rows, "
-#               f"{df_raw['case_number'].nunique()} unique cases)\n")
-#     else:
-#         # Synthetic fallback dataset
-#         print("dataset1.csv not found — using synthetic data\n")
-#         df_raw = pd.DataFrame({
-#             "case_number":   [1,1,2,2,3,4,4,5,6,7,8,9,10,10],
-#             "date_received": ["01/01/24"]*4 + ["03/01/24"]*4 + ["05/01/24"]*6,
-#             "time_received": ["0900h","0900h","0910h","0910h","1400h","1405h",
-#                               "1405h","0855h","0856h","0857h","0858h","0859h","1200hs","1200hs"],
-#             "complainant_name": ["Alice","Bob","Eve","Frank","Carol","Dave","Gina",
-#                                  "Unknown","Unknown","Unknown","Unknown","Unknown","Han","Ivy"],
-#             "sex":    ["F","M","F","M","F","M","F","M","F","M","F","M","F","M"],
-#             "age":    [25,45,27,43,30,28,32,60,22,55,21,44,29,47],
-#             "residential_address": ["Highlands","Highlands","Highlands",
-#                                     "Highlands","Belvedere","Belvedere",
-#                                     "Belvedere","Mbare","Mbare","Mbare",
-#                                     "Avondale","Avondale","CBD","CBD"],
-#             "incident_location": ["College Bar","College Bar","College Bar",
-#                                    "College Bar","Shop A","Shop A","Shop A",
-#                                    None,None,None,None,None,"Market","Market"],
-#             "property_stolen_description": [
-#                 "Cellphone Tablet","Cellphone Tablet","Cellphone","Tablet",
-#                 "Burglar Bar","Burglar Bar","Burglar Bar broken window",
-#                 None,None,None,None,None,"Cash","Cash wallet"],
-#         })
-
-#     # -----------------------------------------------------------------------
-#     # 1. Unsupervised clustering
-#     # -----------------------------------------------------------------------
-#     print("=" * 60)
-#     print(" STAGE 1: Unsupervised Serial Crime Clustering")
-#     print("=" * 60)
-#     model = SerialCrimeLinkageModel()
-#     results = model.train_unsupervised(df_raw)
-
-#     print(f"\n  Cases analysed      : {results['n_cases']}")
-#     print(f"  Serial clusters found: {results['n_serial_clusters']}")
-#     print(f"  Unlinked (noise)     : {results['n_unlinked_cases']}")
-#     if results.get("silhouette_score") is not None:
-#         print(f"  Silhouette score     : {results['silhouette_score']}")
-
-#     if results["clusters"]:
-#         print("\n  Cluster Details:")
-#         for c in results["clusters"]:
-#             print(f"    [{c['label']}]  {c['n_cases']} cases → "
-#                   f"cases {c['case_numbers']}  "
-#                   f"(avg similarity: {c['mean_intra_similarity']})")
-
-#     # -----------------------------------------------------------------------
-#     # 2. Full clustered DataFrame
-#     # -----------------------------------------------------------------------
-#     print("\n" + "=" * 60)
-#     print(" STAGE 2: Case-Level Cluster Assignments")
-#     print("=" * 60)
-#     clustered_df = model.cluster_cases(df_raw)
-#     display_cols = ["case_number", "cluster_label", "max_similarity_score",
-#                     "most_similar_case", "mean_age", "pct_female", "date_ord"]
-#     print(clustered_df[[c for c in display_cols if c in clustered_df.columns]].to_string(index=False))
-
-#     # -----------------------------------------------------------------------
-#     # 3. Pairwise linkage probability
-#     # -----------------------------------------------------------------------
-#     print("\n" + "=" * 60)
-#     print(" STAGE 3: Pairwise Linkage Assessment")
-#     print("=" * 60)
-
-#     agg = model.agg_df_
-#     if len(agg) >= 2:
-#         for (i, j) in [(0, 1), (0, len(agg) - 1)]:
-#             row_a = agg.iloc[i]
-#             row_b = agg.iloc[j]
-#             case_a_dict = {
-#                 "date_ord": row_a["date_ord"],
-#                 "time_min": row_a["time_min"],
-#                 "mean_age": row_a["mean_age"],
-#                 "pct_female": row_a["pct_female"],
-#                 "pct_male": row_a["pct_male"],
-#                 "full_location": row_a["full_location"],
-#                 "mo_text": row_a["mo_text"],
-#             }
-#             case_b_dict = {
-#                 "date_ord": row_b["date_ord"],
-#                 "time_min": row_b["time_min"],
-#                 "mean_age": row_b["mean_age"],
-#                 "pct_female": row_b["pct_female"],
-#                 "pct_male": row_b["pct_male"],
-#                 "full_location": row_b["full_location"],
-#                 "mo_text": row_b["mo_text"],
-#             }
-#             result = model.link_probability(case_a_dict, case_b_dict)
-#             print(f"\n  Case {int(row_a['case_number'])} ←→ Case {int(row_b['case_number'])}")
-#             print(f"    Link Probability : {result['link_probability']:.1%}")
-#             print(f"    Verdict          : {result['verdict']}")
-#             print(f"    Feature Scores   :")
-#             for feat, score in result["feature_scores"].items():
-#                 score_val = score if not (isinstance(score, float) and np.isnan(score)) else 0.0
-#                 bar = "█" * int(score_val * 20)
-#                 print(f"      {feat:<25} {score_val:.3f}  {bar}")
-
-#     # -----------------------------------------------------------------------
-#     # 4. Synthetic supervised demo (auto-generated labels)
-#     # -----------------------------------------------------------------------
-#     print("\n" + "=" * 60)
-#     print(" STAGE 4: Supervised Training Demo (synthetic labels)")
-#     print("=" * 60)
-#     n = len(agg)
-#     if n >= 4:
-#         pairs_X = []
-#         pairs_y = []
-#         for i in range(n):
-#             for j in range(i + 1, n):
-#                 composite = float(model.sim_matrix_[i, j])
-#                 row_a = agg.iloc[i]
-#                 row_b = agg.iloc[j]
-#                 # Temporal
-#                 d_a = row_a["date_ord"] or 0.0
-#                 d_b = row_b["date_ord"] or 0.0
-#                 t_a = row_a["time_min"] or 720.0
-#                 t_b = row_b["time_min"] or 720.0
-#                 date_sim = 1.0 - min(abs(d_a - d_b) / 30.0, 1.0)
-#                 time_sim = 1.0 - min(abs(t_a - t_b) / 720.0, 1.0)
-#                 temporal = 0.6 * date_sim + 0.4 * time_sim
-#                 spatial = _location_similarity(row_a["full_location"], row_b["full_location"])
-#                 if model.tfidf:
-#                     vecs = model.tfidf.transform([row_a["mo_text"] or "", row_b["mo_text"] or ""]).toarray()
-#                     mo_s = float(cosine_similarity([vecs[0]], [vecs[1]])[0, 0])
-#                 else:
-#                     mo_s = 0.5
-#                 age_diff = abs((row_a["mean_age"] or 35) - (row_b["mean_age"] or 35))
-#                 age_s = float(np.exp(-(age_diff ** 2) / 200))
-#                 gender_s = 1.0 - 0.5 * (abs(row_a["pct_female"] - row_b["pct_female"]) +
-#                                          abs(row_a["pct_male"] - row_b["pct_male"]))
-#                 pairs_X.append([temporal, spatial, mo_s, age_s, gender_s])
-#                 # Auto-label: linked if same cluster and cluster != -1
-#                 ca = model.cluster_labels_[i]
-#                 cb = model.cluster_labels_[j]
-#                 pairs_y.append(1 if (ca == cb and ca != -1) else 0)
-
-#         X_arr = np.array(pairs_X)
-#         y_arr = np.array(pairs_y)
-
-#         print(f"  Generated {len(y_arr)} pairs  "
-#               f"({y_arr.sum()} linked, {(~y_arr.astype(bool)).sum()} unlinked)")
-
-#         if y_arr.sum() >= 2 and (~y_arr.astype(bool)).sum() >= 2:
-#             sup_results = model.train_supervised(X_arr, y_arr)
-#             if "error" not in sup_results:
-#                 print(f"  CV ROC-AUC : {sup_results['cv_roc_auc_mean']:.4f} "
-#                       f"(±{sup_results['cv_roc_auc_std']:.4f})")
-#                 print("  Weights used: temporal=0.20, spatial=0.25, mo=0.25, age=0.15, gender=0.15")
-#             else:
-#                 print(f"  Supervised skipped: {sup_results['error']}")
-#         else:
-#             print("  Supervised training skipped: need both linked & unlinked pairs")
-
-#     print("\n✓ Serial Crime Linkage Model — self-test complete.")
-#     print(f"  Model saved → {MODEL_PATH}")

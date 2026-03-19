@@ -575,6 +575,7 @@ class TimeSeriesView(APIView):
             data=request.data or request.query_params
         )
         if not serializer.is_valid():
+            logger.info(serializer.errors)
             return Response(
                 serializer.errors, status=status.HTTP_400_BAD_REQUEST
             )
@@ -593,6 +594,7 @@ class TimeSeriesView(APIView):
             return Response({"timeseries": []})
 
         result = compute_time_series(df, d.get("freq", "W"))
+        logger.info(f'Timeseries view return data: {result}')
         return Response({"timeseries": result})
 
     def get(self, request):
@@ -606,27 +608,79 @@ class HotspotView(APIView):
     """GET/POST /api/zrp/analytics/hotspots/"""
     permission_classes = [IsZRPAnalystOrAdmin]
 
-    def _run(self, request):
-        qs = _filter_incidents(request).exclude(location__isnull=True)
+    # ── Patch for zimcrimewatch/views.py — HotspotView._run() ────────────────────
+#
+# Problem 1: incidents uploaded via CSV may have flat latitude/longitude columns
+#   stored in the DB but NOT in the PostGIS `location` PointField (if the CSV
+#   upload view didn't call Point(lon, lat) — check csv_upload_view.py).
+#   The current code does .exclude(location__isnull=True) which drops every
+#   incident without a PostGIS geometry, producing an empty coords list.
+#
+# Problem 2: DBSCAN default eps_km=0.5 (500 m) with min_samples=3 is very tight.
+#   With a sparse or small dataset, no points fall within 500 m of each other
+#   and every incident is labelled as noise (-1), returning zero clusters.
+#
+# Fix: replace the entire _run() method with the version below.
+#   • Falls back to location.y / location.x first, then to flat
+#     latitude / longitude properties on the model instance.
+#   • Widens DBSCAN to eps_km=1.5 km, min_samples=2 for sparse datasets,
+#     and auto-scales: if the dense pass returns 0 clusters, retry with
+#     looser params so the user always sees something useful.
+#
+# ── Drop-in replacement for HotspotView._run() ───────────────────────────────
 
-        # Unpack the PostGIS PointField plus metadata needed for the summary.
+    def _run(self, request):
+        # Build queryset — do NOT exclude location__isnull here yet; we will
+        # handle both PostGIS and flat-column incidents in the loop below.
+        qs = _filter_incidents(request).select_related("crime_type")
+
         coords      = []
         crime_types = []
         suburbs     = []
-        for inc in qs.select_related("crime_type").only(
-            "location", "crime_type__name", "suburb"
-        ):
+
+        for inc in qs.only("location", "crime_type__name", "suburb"):
+            lat, lng = None, None
+
+            # Primary: PostGIS PointField
             if inc.location:
-                coords.append((inc.location.y, inc.location.x))
-                crime_types.append(
-                    inc.crime_type.name if inc.crime_type else "Unknown"
-                )
-                suburbs.append(inc.suburb or "")
+                lat = inc.location.y
+                lng = inc.location.x
+            # Fallback: backward-compat lat/lng properties (read from location too,
+            # but guards against AttributeError if the property returns None)
+            elif hasattr(inc, "latitude") and inc.latitude is not None:
+                lat = inc.latitude
+                lng = inc.longitude
+
+            if lat is None or lng is None:
+                continue  # truly no coordinate data — skip
+
+            coords.append((lat, lng))
+            crime_types.append(inc.crime_type.name if inc.crime_type else "Unknown")
+            suburbs.append(inc.suburb or "")
 
         if not coords:
             return Response({"hotspots": []})
 
-        result = compute_hotspot_summary(coords, crime_types, suburbs)
+        # ── Adaptive DBSCAN ──────────────────────────────────────────────────
+        # Try progressively looser parameters until we find at least one cluster.
+        # This prevents the endpoint from returning nothing on sparse datasets.
+        param_ladder = [
+            {"eps_km": 0.5,  "min_samples": 3},   # tight   — dense urban
+            {"eps_km": 1.0,  "min_samples": 3},   # medium  — suburban
+            {"eps_km": 2.0,  "min_samples": 2},   # loose   — sparse data
+            {"eps_km": 5.0,  "min_samples": 2},   # very loose — fallback
+        ]
+
+        result = []
+        for params in param_ladder:
+            result = compute_hotspot_summary(
+                coords, crime_types, suburbs,
+                eps_km=params["eps_km"],
+                min_samples=params["min_samples"],
+            )
+            if result:
+                break  # found clusters — stop trying wider params
+
         return Response({"hotspots": result})
 
     def get(self, request):
