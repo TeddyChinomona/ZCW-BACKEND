@@ -1,0 +1,3 @@
+{
+  "start": "gunicorn ZWC_BACKEND.wsgi"
+}
