@@ -31,7 +31,6 @@ SECRET_KEY = 'django-insecure-vka=h#zsg-wb2k4do*^wzx2efb-nf49akt3b%a96p+gf(9*fj^
 DEBUG = True
 
 ALLOWED_HOSTS = [
-    '10.0.2.2',
     '127.0.0.1'
 ]
 
@@ -93,13 +92,15 @@ DATABASES = {
         'PASSWORD': os.getenv('PASSWORD'),
         'HOST': os.getenv('HOST'),
         'PORT': os.getenv('PORT'),
+        'SSL mode': os.getenv('SSL_MODE'),
+        'CA': os.getenv('CA'),
+        'CONNECTION LIMIT': os.getenv('CONNECTION_LIMIT')
     }
 }
 
 # POSTGIS GEOS & GDAL dll files
-GDAL_LIBRARY_PATH = Path('libgdal-35.dll')
-GEOS_LIBRARY_PATH = Path('libgeos_c.dll')
-
+GDAL_LIBRARY_PATH = r'C:\Program Files\PostgreSQL\18\bin\libgdal-35.dll'
+GEOS_LIBRARY_PATH = r'C:\Program Files\PostgreSQL\18\bin\libgeos_c.dll'
 
 # Password validation
 # https://docs.djangoproject.com/en/6.0/ref/settings/#auth-password-validators
@@ -137,11 +138,8 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 
-# ─── CORS (for React dashboard at separate origin) ─────────────────────────────
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5173",
-    "http://localhost:5174"
-]
+CORS_ALLOW_ALL_ORIGINS = True
+
 
 # ─── Django REST Framework ──────────────────────────────────────────────────────
 REST_FRAMEWORK = {
