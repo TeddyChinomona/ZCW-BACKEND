@@ -1,26 +1,33 @@
-### ZimCrimeWatch API - REST Client Test File
-### Compatible with: VS Code REST Client extension, JetBrains HTTP Client
+### ZimCrimeWatch API — REST Client Test File
+### Compatible with VS Code REST Client, JetBrains HTTP Client
 ###
 ### USAGE
-### -----
-### 1. Run Login first — copy the returned `access` and `refresh` values
-### 2. Paste them into the @accessToken / @refreshToken variables below
+### ─────
+### 1. Run Login first — copy the returned `access` and `refresh` tokens
+### 2. Paste them into @accessToken / @refreshToken below
 ### 3. Run any other request
 ###
-### Variables
+### New in this revision
+### ─────────────────────
+### • POST /api/public/auth/register/         — self-registration
+### • POST /api/public/auth/forgot-password/  — request reset token
+### • POST /api/public/auth/reset-password/   — set new password
+### • POST /api/zrp/auth/change-password/     — authenticated change
+###
+
 @baseUrl       = http://127.0.0.1:8000/api
 @contentType   = application/json
-@accessToken   = eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoiYWNjZXNzIiwiZXhwIjoxNzcyNTg3NDM2LCJpYXQiOjE3NzI1ODM4MzYsImp0aSI6IjBjY2VhMzdjODBhYTQ3ODhhN2MwYWMzYzhjNmE2ZDQzIiwidXNlcl9pZCI6IjEifQ.ZZsraOV624-TD70vI1gMINKjYjx4NoqTZwyVpEila18
-@refreshToken  = eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoicmVmcmVzaCIsImV4cCI6MTc3MjY3MDIzNiwiaWF0IjoxNzcyNTgzODM2LCJqdGkiOiIxZmZhMTM0M2JlYmI0YmY0YTNlMzkwZmM3YTQ1MTJhYiIsInVzZXJfaWQiOiIxIn0.rmYWSg8MUxZCJn4-z_sqJpJbXxw5rnxblkqb_ptjtQ8
+@accessToken   = PASTE_ACCESS_TOKEN_HERE
+@refreshToken  = PASTE_REFRESH_TOKEN_HERE
 @badgeNumber   = 1234
 @password      = qwerty1234
+
 
 ###############################################################################
 # 1. AUTHENTICATION
 ###############################################################################
 
 ### 1.1 Login — obtain access + refresh token pair
-# @name login
 POST {{baseUrl}}/public/auth/login/
 Content-Type: {{contentType}}
 
@@ -31,45 +38,53 @@ Content-Type: {{contentType}}
 
 ###
 
-### 1.2 Refresh access token
-# Send current refresh token → receive new access token
-# (If ROTATE_REFRESH_TOKENS=True, a new refresh token is also returned)
-# @name tokenRefresh
-POST {{baseUrl}}/public/auth/token/refresh/
+### 1.2 Register — create a new officer account (role = officer by default)
+POST {{baseUrl}}/public/auth/register/
 Content-Type: {{contentType}}
 
 {
-  "refresh": "{{refreshToken}}"
+  "username":         "constable_nyasha",
+  "first_name":       "Nyasha",
+  "last_name":        "Moyo",
+  "zrp_badge_number": "ZRP-5544",
+  "password":         "SecurePass@2025",
+  "password_confirm": "SecurePass@2025"
 }
 
 ###
 
-### 1.3 Logout — blacklist the refresh token
-# After this call the refresh token is permanently invalid.
-# The access token remains valid until it expires (default 15 min).
-POST {{baseUrl}}/public/auth/logout/
+### 1.3 Register — password mismatch (expect 400)
+POST {{baseUrl}}/public/auth/register/
 Content-Type: {{contentType}}
-Authorization: Bearer {{accessToken}}
 
 {
-  "refresh": "{{refreshToken}}"
+  "username":         "constable_test",
+  "first_name":       "Test",
+  "last_name":        "Officer",
+  "zrp_badge_number": "ZRP-9999",
+  "password":         "Password@1",
+  "password_confirm": "Password@2"
 }
 
 ###
 
-### 1.4 Login — invalid credentials (expect 401)
-POST {{baseUrl}}/public/auth/login/
+### 1.4 Register — duplicate badge number (expect 400)
+POST {{baseUrl}}/public/auth/register/
 Content-Type: {{contentType}}
 
 {
-  "zrp_badge_number": "ZRP-000000",
-  "password": "wrongpassword"
+  "username":         "duplicate_user",
+  "first_name":       "Dupe",
+  "last_name":        "User",
+  "zrp_badge_number": "{{badgeNumber}}",
+  "password":         "SecurePass@2025",
+  "password_confirm": "SecurePass@2025"
 }
 
 ###
 
-### 1.5 Login — missing password field (expect 400)
-POST {{baseUrl}}/public/auth/login/
+### 1.5 Forgot Password — request a reset token
+POST {{baseUrl}}/public/auth/forgot-password/
 Content-Type: {{contentType}}
 
 {
@@ -78,20 +93,105 @@ Content-Type: {{contentType}}
 
 ###
 
-### 1.6 Refresh — invalid token (expect 400 / 401)
+### 1.6 Forgot Password — badge number not found (same generic response)
+POST {{baseUrl}}/public/auth/forgot-password/
+Content-Type: {{contentType}}
+
+{
+  "zrp_badge_number": "ZRP-000000-NONEXISTENT"
+}
+
+###
+
+### 1.7 Reset Password — set a new password using the token from step 1.5
+### Replace RESET_TOKEN_HERE with the token returned in 1.5
+POST {{baseUrl}}/public/auth/reset-password/
+Content-Type: {{contentType}}
+
+{
+  "zrp_badge_number": "{{badgeNumber}}",
+  "token":            "RESET_TOKEN_HERE",
+  "new_password":     "NewSecure@2025!",
+  "confirm_password": "NewSecure@2025!"
+}
+
+###
+
+### 1.8 Reset Password — password mismatch (expect 400)
+POST {{baseUrl}}/public/auth/reset-password/
+Content-Type: {{contentType}}
+
+{
+  "zrp_badge_number": "{{badgeNumber}}",
+  "token":            "anytoken",
+  "new_password":     "Password@1",
+  "confirm_password": "Password@2"
+}
+
+###
+
+### 1.9 Change Password (authenticated — must be logged in)
+POST {{baseUrl}}/zrp/auth/change-password/
+Authorization: Bearer {{accessToken}}
+Content-Type: {{contentType}}
+
+{
+  "current_password": "{{password}}",
+  "new_password":     "NewSecure@2025!",
+  "confirm_password": "NewSecure@2025!"
+}
+
+###
+
+### 1.10 Change Password — wrong current password (expect 400)
+POST {{baseUrl}}/zrp/auth/change-password/
+Authorization: Bearer {{accessToken}}
+Content-Type: {{contentType}}
+
+{
+  "current_password": "wrongpassword",
+  "new_password":     "NewSecure@2025!",
+  "confirm_password": "NewSecure@2025!"
+}
+
+###
+
+### 1.11 Token Refresh
 POST {{baseUrl}}/public/auth/token/refresh/
 Content-Type: {{contentType}}
 
 {
-  "refresh": "this.is.not.a.valid.token"
+  "refresh": "{{refreshToken}}"
+}
+
+###
+
+### 1.12 Logout — blacklist the refresh token
+POST {{baseUrl}}/public/auth/logout/
+Authorization: Bearer {{accessToken}}
+Content-Type: {{contentType}}
+
+{
+  "refresh": "{{refreshToken}}"
+}
+
+###
+
+### 1.13 Login — invalid credentials (expect 401)
+POST {{baseUrl}}/public/auth/login/
+Content-Type: {{contentType}}
+
+{
+  "zrp_badge_number": "ZRP-000000",
+  "password":         "wrongpassword"
 }
 
 
 ###############################################################################
-# 2. PUBLIC ENDPOINTS  (no authentication required)
+# 2. PUBLIC ENDPOINTS (no authentication required)
 ###############################################################################
 
-### 2.1 Get anonymized crime map pins (all)
+### 2.1 Get all anonymized crime map pins
 GET {{baseUrl}}/public/crimes/
 Accept: {{contentType}}
 
@@ -115,19 +215,13 @@ Accept: {{contentType}}
 
 ###
 
-### 2.5 Filter public crimes — combined filters
-GET {{baseUrl}}/public/crimes/?crime_type_id=2&suburb=Avondale&start_date=2024-06-01&end_date=2024-12-31
-Accept: {{contentType}}
-
-###
-
-### 2.6 Get all crime types + icons (public)
+### 2.5 Get all crime types (used by Flutter filter sheet)
 GET {{baseUrl}}/public/crime-types/
 Accept: {{contentType}}
 
 
 ###############################################################################
-# 3. ZRP DASHBOARD — INCIDENT CRUD  (JWT required)
+# 3. ZRP DASHBOARD — INCIDENT CRUD
 ###############################################################################
 
 ### 3.1 List all incidents
@@ -137,152 +231,73 @@ Accept: {{contentType}}
 
 ###
 
-### 3.2 List incidents filtered by crime type
-GET {{baseUrl}}/zrp/incidents/?crime_type_id=1
+### 3.2 Filter by crime type + status
+GET {{baseUrl}}/zrp/incidents/?crime_type_id=1&status=under_investigation
 Authorization: Bearer {{accessToken}}
-Accept: {{contentType}}
 
 ###
 
-### 3.3 List incidents filtered by suburb + status
-GET {{baseUrl}}/zrp/incidents/?suburb=Harare+CBD&status=under_investigation
-Authorization: Bearer {{accessToken}}
-Accept: {{contentType}}
-
-###
-
-### 3.4 List incidents filtered by date range
-GET {{baseUrl}}/zrp/incidents/?start_date=2024-01-01&end_date=2024-06-30
-Authorization: Bearer {{accessToken}}
-Accept: {{contentType}}
-
-###
-
-### 3.5 Create a new incident
-# latitude + longitude are submitted as plain floats;
-# the backend converts them to a PostGIS Point internally.
+### 3.3 Create a new incident
 POST {{baseUrl}}/zrp/incidents/
 Authorization: Bearer {{accessToken}}
 Content-Type: {{contentType}}
 
 {
-  "case_number":            "ZRP-2024-00123",
+  "case_number":            "ZRP-2025-00999",
   "crime_type":             1,
-  "timestamp":              "2024-08-15T14:30:00Z",
+  "timestamp":              "2025-06-15T14:30:00Z",
   "latitude":               -17.8292,
   "longitude":              31.0522,
   "suburb":                 "Mbare",
-  "description_narrative":  "Suspect broke rear window and stole laptop bag.",
-  "modus_operandi":         "Smash and grab targeting parked vehicles near market.",
+  "description_narrative":  "Suspect stole laptop bag from parked vehicle.",
+  "modus_operandi":         "Smash and grab — parked vehicles near busy market.",
   "status":                 "reported",
-  "weapon_used":            "Unknown",
-  "num_suspects":           2,
-  "serial_group_label":     ""
+  "weapon_used":            "None",
+  "num_suspects":           2
 }
 
 ###
 
-### 3.6 Create incident — missing required fields (expect 400)
-POST {{baseUrl}}/zrp/incidents/
-Authorization: Bearer {{accessToken}}
-Content-Type: {{contentType}}
-
-{
-  "suburb": "Avondale"
-}
-
-###
-
-### 3.7 Create incident — duplicate case number (expect 400)
-POST {{baseUrl}}/zrp/incidents/
-Authorization: Bearer {{accessToken}}
-Content-Type: {{contentType}}
-
-{
-  "case_number": "ZRP-2024-00123",
-  "crime_type":  1,
-  "latitude":    -17.8292,
-  "longitude":   31.0522
-}
-
-###
-
-### 3.8 Get a single incident by ID
+### 3.4 Get a single incident
 GET {{baseUrl}}/zrp/incidents/1/
 Authorization: Bearer {{accessToken}}
-Accept: {{contentType}}
 
 ###
 
-### 3.9 Get non-existent incident (expect 404)
-GET {{baseUrl}}/zrp/incidents/99999/
-Authorization: Bearer {{accessToken}}
-Accept: {{contentType}}
-
-###
-
-### 3.10 Update (partial PATCH) an incident — change status + add coordinates
+### 3.5 Update an incident (partial PATCH-style)
 PUT {{baseUrl}}/zrp/incidents/1/
 Authorization: Bearer {{accessToken}}
 Content-Type: {{contentType}}
 
 {
-  "status":    "under_investigation",
-  "latitude":  -17.8300,
-  "longitude": 31.0530
+  "status": "under_investigation",
+  "serial_group_label": "Mbare Laptop Gang 2025"
 }
 
 ###
 
-### 3.11 Update incident — only move location (coordinates only)
-PUT {{baseUrl}}/zrp/incidents/1/
-Authorization: Bearer {{accessToken}}
-Content-Type: {{contentType}}
-
-{
-  "latitude":  -17.7721,
-  "longitude": 31.0447
-}
-
-###
-
-### 3.12 Delete an incident (admin only — expect 403 for non-admin)
-DELETE {{baseUrl}}/zrp/incidents/1/
+### 3.6 Get similar incidents (Profile Matcher)
+GET {{baseUrl}}/zrp/incidents/1/similar/?top_n=5
 Authorization: Bearer {{accessToken}}
 
 ###
 
-### 3.13 Get similar cases for an incident (profile matching)
-GET {{baseUrl}}/zrp/incidents/1/similar/
-Authorization: Bearer {{accessToken}}
-Accept: {{contentType}}
-
-###
-
-### 3.14 Get similar cases — custom top_n
-GET {{baseUrl}}/zrp/incidents/1/similar/?top_n=10
-Authorization: Bearer {{accessToken}}
-Accept: {{contentType}}
-
-###
-
-### 3.15 Access incidents without token (expect 401)
+### 3.7 Access without token (expect 401)
 GET {{baseUrl}}/zrp/incidents/
 Accept: {{contentType}}
 
 
 ###############################################################################
-# 4. ZRP DASHBOARD — CRIME TYPE CRUD  (JWT required)
+# 4. CRIME TYPES
 ###############################################################################
 
 ### 4.1 List all crime types with incident counts
 GET {{baseUrl}}/zrp/crime-types/
 Authorization: Bearer {{accessToken}}
-Accept: {{contentType}}
 
 ###
 
-### 4.2 Create a new crime type
+### 4.2 Create a crime type (analyst/admin only)
 POST {{baseUrl}}/zrp/crime-types/
 Authorization: Bearer {{accessToken}}
 Content-Type: {{contentType}}
@@ -290,68 +305,30 @@ Content-Type: {{contentType}}
 {
   "name":        "Cybercrime",
   "description": "Crimes involving computers, networks, or digital devices.",
-  "icon":        "laptop-icon"
+  "icon":        "💻"
 }
 
 ###
 
-### 4.3 Create crime type — duplicate name (expect 400)
-POST {{baseUrl}}/zrp/crime-types/
-Authorization: Bearer {{accessToken}}
-Content-Type: {{contentType}}
-
-{
-  "name": "Cybercrime"
-}
-
-###
-
-### 4.4 Get a single crime type
+### 4.3 Get a single crime type
 GET {{baseUrl}}/zrp/crime-types/1/
 Authorization: Bearer {{accessToken}}
-Accept: {{contentType}}
-
-###
-
-### 4.5 Update a crime type
-PUT {{baseUrl}}/zrp/crime-types/1/
-Authorization: Bearer {{accessToken}}
-Content-Type: {{contentType}}
-
-{
-  "description": "Updated description for this crime category.",
-  "icon":        "new-icon-slug"
-}
-
-###
-
-### 4.6 Delete a crime type
-DELETE {{baseUrl}}/zrp/crime-types/1/
-Authorization: Bearer {{accessToken}}
 
 
 ###############################################################################
-# 5. ZRP DASHBOARD — KPI SUMMARY  (JWT required)
+# 5. DASHBOARD KPI
 ###############################################################################
 
-### 5.1 Get dashboard summary (total incidents, last 7 days, last 30 days, by status, top types)
+### 5.1 Dashboard summary (KPI cards)
 GET {{baseUrl}}/zrp/dashboard/summary/
 Authorization: Bearer {{accessToken}}
-Accept: {{contentType}}
 
 
 ###############################################################################
-# 6. ANALYTICS  (analyst + admin role required)
+# 6. ANALYTICS
 ###############################################################################
 
-### 6.1 Heatmap — GET with query params
-GET {{baseUrl}}/zrp/analytics/heatmap/?crime_type_id=1&start_date=2024-01-01&end_date=2024-12-31&bandwidth=0.01
-Authorization: Bearer {{accessToken}}
-Accept: {{contentType}}
-
-###
-
-### 6.2 Heatmap — POST with body
+### 6.1 Generate KDE heatmap
 POST {{baseUrl}}/zrp/analytics/heatmap/
 Authorization: Bearer {{accessToken}}
 Content-Type: {{contentType}}
@@ -365,7 +342,7 @@ Content-Type: {{contentType}}
 
 ###
 
-### 6.3 Heatmap — all crime types, no date filter
+### 6.2 Heatmap — all crime types, no date filter
 POST {{baseUrl}}/zrp/analytics/heatmap/
 Authorization: Bearer {{accessToken}}
 Content-Type: {{contentType}}
@@ -374,48 +351,33 @@ Content-Type: {{contentType}}
 
 ###
 
-### 6.4 Time series — GET (weekly aggregation)
-GET {{baseUrl}}/zrp/analytics/timeseries/?freq=W&start_date=2024-01-01&end_date=2024-12-31
-Authorization: Bearer {{accessToken}}
-Accept: {{contentType}}
-
-###
-
-### 6.5 Time series — POST (monthly, specific crime type)
+### 6.3 Time series (weekly)
 POST {{baseUrl}}/zrp/analytics/timeseries/
 Authorization: Bearer {{accessToken}}
 Content-Type: {{contentType}}
 
 {
-  "crime_type_id": 2,
-  "start_date":    "2023-01-01",
-  "end_date":      "2024-12-31",
-  "freq":          "M"
+  "freq":       "W",
+  "start_date": "2024-01-01",
+  "end_date":   "2024-12-31"
 }
 
 ###
 
-### 6.6 Time series — daily frequency
+### 6.4 Time series (monthly)
 POST {{baseUrl}}/zrp/analytics/timeseries/
 Authorization: Bearer {{accessToken}}
 Content-Type: {{contentType}}
 
 {
-  "freq": "D",
-  "start_date": "2024-06-01",
-  "end_date":   "2024-06-30"
+  "freq":       "M",
+  "start_date": "2023-01-01",
+  "end_date":   "2024-12-31"
 }
 
 ###
 
-### 6.7 Hotspot detection — GET with filters
-GET {{baseUrl}}/zrp/analytics/hotspots/?crime_type_id=1&start_date=2024-01-01&end_date=2024-12-31
-Authorization: Bearer {{accessToken}}
-Accept: {{contentType}}
-
-###
-
-### 6.8 Hotspot detection — POST (no filters, all data)
+### 6.5 Hotspot detection
 POST {{baseUrl}}/zrp/analytics/hotspots/
 Authorization: Bearer {{accessToken}}
 Content-Type: {{contentType}}
@@ -424,7 +386,7 @@ Content-Type: {{contentType}}
 
 ###
 
-### 6.9 Profile match — find similar cases to incident #1
+### 6.6 Profile Match
 POST {{baseUrl}}/zrp/analytics/profile-match/
 Authorization: Bearer {{accessToken}}
 Content-Type: {{contentType}}
@@ -434,59 +396,51 @@ Content-Type: {{contentType}}
   "top_n":       5
 }
 
+
+###############################################################################
+# 7. SERIAL CRIME LINKAGE
+###############################################################################
+
+### 7.1 Train the serial linkage model (DBSCAN)
+POST {{baseUrl}}/zrp/analytics/serial-linkage/train/
+Authorization: Bearer {{accessToken}}
+Content-Type: {{contentType}}
+
+{}
+
 ###
 
-### 6.10 Profile match — larger result set
-POST {{baseUrl}}/zrp/analytics/profile-match/
+### 7.2 Get cluster assignments
+POST {{baseUrl}}/zrp/analytics/serial-linkage/cluster/
+Authorization: Bearer {{accessToken}}
+Content-Type: {{contentType}}
+
+{}
+
+###
+
+### 7.3 Link probability between two incidents
+POST {{baseUrl}}/zrp/analytics/serial-linkage/link-probability/
 Authorization: Bearer {{accessToken}}
 Content-Type: {{contentType}}
 
 {
-  "incident_id": 1,
-  "top_n":       20
-}
-
-###
-
-### 6.11 Profile match — non-existent incident (expect 404)
-POST {{baseUrl}}/zrp/analytics/profile-match/
-Authorization: Bearer {{accessToken}}
-Content-Type: {{contentType}}
-
-{
-  "incident_id": 99999,
-  "top_n":       5
+  "incident_id_a": 1,
+  "incident_id_b": 2
 }
 
 
 ###############################################################################
-# 7. ADMIN — USER MANAGEMENT  (admin role required)
+# 8. ADMIN — USER MANAGEMENT
 ###############################################################################
 
-### 7.1 List all users
+### 8.1 List all users
 GET {{baseUrl}}/zrp/users/
 Authorization: Bearer {{accessToken}}
-Accept: {{contentType}}
 
 ###
 
-### 7.2 Create a new officer account
-POST {{baseUrl}}/zrp/users/
-Authorization: Bearer {{accessToken}}
-Content-Type: {{contentType}}
-
-{
-  "username":         "jdoe",
-  "first_name":       "John",
-  "last_name":        "Doe",
-  "zrp_badge_number": "ZRP-005678",
-  "password":         "SecurePass123!",
-  "role":             "officer"
-}
-
-###
-
-### 7.3 Create an analyst account
+### 8.2 Create a new analyst account (admin only)
 POST {{baseUrl}}/zrp/users/
 Authorization: Bearer {{accessToken}}
 Content-Type: {{contentType}}
@@ -496,54 +450,14 @@ Content-Type: {{contentType}}
   "first_name":       "Alice",
   "last_name":        "Smith",
   "zrp_badge_number": "ZRP-009999",
-  "password":         "Analyst@2024!",
-  "role":             "analyst",
-  "base_station":     1
+  "password":         "Analyst@2025!",
+  "role":             "analyst"
 }
 
 ###
 
-### 7.4 Create user — duplicate badge number (expect 400)
-POST {{baseUrl}}/zrp/users/
-Authorization: Bearer {{accessToken}}
-Content-Type: {{contentType}}
-
-{
-  "username":         "duplicate",
-  "first_name":       "Test",
-  "last_name":        "User",
-  "zrp_badge_number": "ZRP-005678",
-  "password":         "Pass1234!",
-  "role":             "officer"
-}
-
-###
-
-### 7.5 Create user — weak password (expect 400)
-POST {{baseUrl}}/zrp/users/
-Authorization: Bearer {{accessToken}}
-Content-Type: {{contentType}}
-
-{
-  "username":         "weakuser",
-  "first_name":       "Weak",
-  "last_name":        "Pass",
-  "zrp_badge_number": "ZRP-000001",
-  "password":         "1234",
-  "role":             "officer"
-}
-
-###
-
-### 7.6 Get a single user by ID
-GET {{baseUrl}}/zrp/users/1/
-Authorization: Bearer {{accessToken}}
-Accept: {{contentType}}
-
-###
-
-### 7.7 Update user role
-PUT {{baseUrl}}/zrp/users/1/
+### 8.3 Promote a registered officer to analyst
+PUT {{baseUrl}}/zrp/users/2/
 Authorization: Bearer {{accessToken}}
 Content-Type: {{contentType}}
 
@@ -553,23 +467,22 @@ Content-Type: {{contentType}}
 
 ###
 
-### 7.8 Deactivate a user account (soft delete)
-DELETE {{baseUrl}}/zrp/users/2/
+### 8.4 Deactivate a user account (soft delete)
+DELETE {{baseUrl}}/zrp/users/3/
 Authorization: Bearer {{accessToken}}
 
 ###
 
-### 7.9 Access user management without admin role (expect 403)
+### 8.5 Non-admin tries to access user list (expect 403)
 GET {{baseUrl}}/zrp/users/
 Authorization: Bearer {{accessToken}}
-Accept: {{contentType}}
 
 
 ###############################################################################
-# 8. ADMIN — ML MODEL TRAINING
+# 9. ML TRAINING
 ###############################################################################
 
-### 8.1 Trigger ProfileMatcher model re-training
+### 9.1 Trigger ML training (auto-selects supervised or unsupervised)
 POST {{baseUrl}}/zrp/ml/train/
 Authorization: Bearer {{accessToken}}
 Content-Type: {{contentType}}
@@ -578,8 +491,25 @@ Content-Type: {{contentType}}
 
 ###
 
-### 8.2 Trigger training without admin role (expect 403)
+### 9.2 Without admin role (expect 403)
 POST {{baseUrl}}/zrp/ml/train/
 Content-Type: {{contentType}}
 
 {}
+
+
+###############################################################################
+# 10. CSV BULK UPLOAD
+###############################################################################
+
+### 10.1 Upload crime data CSV (multipart — use REST Client or Postman)
+### POST {{baseUrl}}/zrp/data/upload-csv/
+### Authorization: Bearer {{accessToken}}
+### Content-Type: multipart/form-data; boundary=----ZCWBoundary
+###
+### ------ZCWBoundary
+### Content-Disposition: form-data; name="file"; filename="crimes.csv"
+### Content-Type: text/csv
+###
+### < /path/to/your/zimcrime_watch_dataset.csv
+### ------ZCWBoundary--

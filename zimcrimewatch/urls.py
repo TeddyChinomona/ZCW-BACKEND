@@ -3,35 +3,82 @@ zimcrimewatch/urls.py
 =====================
 ZimCrimeWatch — URL Configuration
 
-Maps all API endpoints to their corresponding APIView classes.
+All endpoints map directly to APIView subclasses.
 
-Auth endpoints summary
-----------------------
-POST  api/public/auth/login/          LoginView        — get access + refresh tokens
-POST  api/public/auth/token/refresh/  TokenRefreshView — exchange refresh → new access
-POST  api/public/auth/logout/         LogoutView       — blacklist refresh token
+Auth endpoints
+--------------
+POST  /api/public/auth/login/             LoginView               — get access + refresh tokens
+POST  /api/public/auth/register/          RegisterView            — NEW: self-register as officer
+POST  /api/public/auth/token/refresh/     TokenRefreshView        — exchange refresh → new access
+POST  /api/public/auth/logout/            LogoutView              — blacklist refresh token
+POST  /api/public/auth/forgot-password/   ForgotPasswordView      — NEW: request reset token
+POST  /api/public/auth/reset-password/    ResetPasswordView       — NEW: set new password with token
+POST  /api/zrp/auth/change-password/      ChangePasswordView      — NEW: authenticated change
 
-Serial Crime Linkage endpoints  ← NEW
+Public endpoints (no auth required)
+-------------------------------------
+GET   /api/public/crimes/                 PublicCrimeMapView
+GET   /api/public/crime-types/            PublicCrimeTypeListView
+
+ZRP Dashboard (auth required)
+------------------------------
+GET   /api/zrp/incidents/                 IncidentListCreateView
+POST  /api/zrp/incidents/                 IncidentListCreateView
+GET   /api/zrp/incidents/<id>/            IncidentDetailView
+PUT   /api/zrp/incidents/<id>/            IncidentDetailView
+DEL   /api/zrp/incidents/<id>/            IncidentDetailView
+GET   /api/zrp/incidents/<id>/similar/    IncidentSimilarCasesView
+GET   /api/zrp/dashboard/summary/         DashboardSummaryView
+GET   /api/zrp/crime-types/               CrimeTypeListCreateView
+POST  /api/zrp/crime-types/               CrimeTypeListCreateView
+GET   /api/zrp/crime-types/<id>/          CrimeTypeDetailView
+PUT   /api/zrp/crime-types/<id>/          CrimeTypeDetailView
+DEL   /api/zrp/crime-types/<id>/          CrimeTypeDetailView
+
+Analytics (analyst + admin required)
 --------------------------------------
-POST  api/zrp/analytics/serial-linkage/train/            — train DBSCAN cluster model
-POST  api/zrp/analytics/serial-linkage/cluster/          — get cluster assignments
-POST  api/zrp/analytics/serial-linkage/link-probability/ — pairwise link probability
+GET   /api/zrp/analytics/heatmap/
+POST  /api/zrp/analytics/heatmap/
+GET   /api/zrp/analytics/timeseries/
+POST  /api/zrp/analytics/timeseries/
+GET   /api/zrp/analytics/hotspots/
+POST  /api/zrp/analytics/hotspots/
+POST  /api/zrp/analytics/profile-match/
+
+Serial Crime Linkage (analyst + admin required)
+------------------------------------------------
+POST  /api/zrp/analytics/serial-linkage/train/
+POST  /api/zrp/analytics/serial-linkage/cluster/
+POST  /api/zrp/analytics/serial-linkage/link-probability/
+
+Admin only
+-----------
+GET   /api/zrp/users/                     UserListCreateView
+POST  /api/zrp/users/                     UserListCreateView
+GET   /api/zrp/users/<id>/                UserDetailView
+PUT   /api/zrp/users/<id>/                UserDetailView
+DEL   /api/zrp/users/<id>/                UserDetailView
+POST  /api/zrp/ml/train/                  MLTrainView
+POST  /api/zrp/data/upload-csv/           CSVUploadView
 """
 from django.urls import path
-from . import (views, csv_upload_view)  # Import views and the new CSV upload view
 
+from . import views, csv_upload_view
 
 app_name = "zimcrimewatch"
 
 urlpatterns = [
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Authentication  (used by both Flutter app and React dashboard)
-    # ──────────────────────────────────────────────────────────────────────────
+    # ── Authentication ────────────────────────────────────────────────────────
     path(
         "public/auth/login/",
         views.LoginView.as_view(),
         name="auth-login",
+    ),
+    path(
+        "public/auth/register/",
+        views.RegisterView.as_view(),
+        name="auth-register",
     ),
     path(
         "public/auth/token/refresh/",
@@ -43,10 +90,24 @@ urlpatterns = [
         views.LogoutView.as_view(),
         name="auth-logout",
     ),
+    path(
+        "public/auth/forgot-password/",
+        views.ForgotPasswordView.as_view(),
+        name="auth-forgot-password",
+    ),
+    path(
+        "public/auth/reset-password/",
+        views.ResetPasswordView.as_view(),
+        name="auth-reset-password",
+    ),
+    # Authenticated password change (different prefix — requires JWT)
+    path(
+        "zrp/auth/change-password/",
+        views.ChangePasswordView.as_view(),
+        name="auth-change-password",
+    ),
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Public  (Flutter mobile app — no authentication required)
-    # ──────────────────────────────────────────────────────────────────────────
+    # ── Public (Flutter mobile app — no auth required) ────────────────────────
     path(
         "public/crimes/",
         views.PublicCrimeMapView.as_view(),
@@ -58,9 +119,7 @@ urlpatterns = [
         name="public-crime-types",
     ),
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # ZRP Dashboard — Incident CRUD  (React web app, JWT required)
-    # ──────────────────────────────────────────────────────────────────────────
+    # ── ZRP Dashboard — Incident CRUD ─────────────────────────────────────────
     path(
         "zrp/incidents/",
         views.IncidentListCreateView.as_view(),
@@ -71,16 +130,20 @@ urlpatterns = [
         views.IncidentDetailView.as_view(),
         name="incident-detail",
     ),
-    # ProfileMatcher similar-cases endpoint — uses the fixed find_similar()
     path(
         "zrp/incidents/<int:pk>/similar/",
         views.IncidentSimilarCasesView.as_view(),
         name="incident-similar",
     ),
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # ZRP Dashboard — Crime Type CRUD
-    # ──────────────────────────────────────────────────────────────────────────
+    # ── ZRP Dashboard — KPI summary ───────────────────────────────────────────
+    path(
+        "zrp/dashboard/summary/",
+        views.DashboardSummaryView.as_view(),
+        name="dashboard-summary",
+    ),
+
+    # ── ZRP Dashboard — Crime Type CRUD ──────────────────────────────────────
     path(
         "zrp/crime-types/",
         views.CrimeTypeListCreateView.as_view(),
@@ -92,18 +155,7 @@ urlpatterns = [
         name="crime-type-detail",
     ),
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # ZRP Dashboard — KPI summary
-    # ──────────────────────────────────────────────────────────────────────────
-    path(
-        "zrp/dashboard/summary/",
-        views.DashboardSummaryView.as_view(),
-        name="dashboard-summary",
-    ),
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Analytics modules  (analyst + admin only)
-    # ──────────────────────────────────────────────────────────────────────────
+    # ── Analytics modules (analyst + admin only) ──────────────────────────────
     path(
         "zrp/analytics/heatmap/",
         views.HeatmapView.as_view(),
@@ -125,35 +177,24 @@ urlpatterns = [
         name="analytics-profile-match",
     ),
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Serial Crime Linkage  ← NEW
-    # Integrates serial_crime_linkage.py into the backend API.
-    # ──────────────────────────────────────────────────────────────────────────
-
-    # Train the DBSCAN serial-linkage model on all current incidents.
+    # ── Serial Crime Linkage ──────────────────────────────────────────────────
     path(
         "zrp/analytics/serial-linkage/train/",
         views.SerialLinkageTrainView.as_view(),
         name="serial-linkage-train",
     ),
-
-    # Return cluster assignments for all incidents (or a filtered subset).
     path(
         "zrp/analytics/serial-linkage/cluster/",
         views.SerialLinkageClusterView.as_view(),
         name="serial-linkage-cluster",
     ),
-
-    # Compute pairwise link probability between two specific incidents.
     path(
         "zrp/analytics/serial-linkage/link-probability/",
         views.SerialLinkageProbabilityView.as_view(),
         name="serial-linkage-probability",
     ),
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Admin — User management
-    # ──────────────────────────────────────────────────────────────────────────
+    # ── Admin — User management ───────────────────────────────────────────────
     path(
         "zrp/users/",
         views.UserListCreateView.as_view(),
@@ -165,26 +206,14 @@ urlpatterns = [
         name="user-detail",
     ),
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Admin — ML model training trigger  (ProfileMatcher only)
-    # For serial linkage training use /analytics/serial-linkage/train/ instead.
-    # ──────────────────────────────────────────────────────────────────────────
+    # ── Admin — ML model training ─────────────────────────────────────────────
     path(
         "zrp/ml/train/",
         views.MLTrainView.as_view(),
         name="ml-train",
     ),
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Admin — Bulk CSV data upload  (fulfils ADM-03 requirement)
-    # ──────────────────────────────────────────────────────────────────────────
-    # POST  /api/zrp/data/upload-csv/
-    #
-    # Accepts multipart/form-data with one field:
-    #   file  — a .csv matching the zimcrime_watch_dataset schema
-    #
-    # Returns: { "created": N, "skipped": N, "errors": [...] }
-    # ──────────────────────────────────────────────────────────────────────────
+    # ── Admin — Bulk CSV data upload (fulfils ADM-03) ─────────────────────────
     path(
         "zrp/data/upload-csv/",
         csv_upload_view.CSVUploadView.as_view(),
