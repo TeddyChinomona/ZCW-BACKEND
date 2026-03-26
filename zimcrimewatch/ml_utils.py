@@ -2,16 +2,22 @@
 ml_utils.py  —  ZimCrimeWatch Machine Learning Utilities
 =========================================================
 
-Provides four core ML helpers consumed by the API views:
-  1. compute_kde_heatmap      — KDE density surface for the heatmap overlay
-  2. compute_time_series      — trend / seasonal / residual decomposition
-  3. ProfileMatcher           — Random Forest classifier for serial-group linkage
-  4. compute_hotspot_summary  — DBSCAN spatial clustering of crime locations
+What this file provides:
+  1. compute_kde_heatmap    — turns crime coordinates into a density heatmap
+  2. compute_time_series    — breaks crime counts into trend/seasonal/residual
+  3. ProfileMatcher         — Random Forest classifier that groups crimes by similarity
+       .train()             — trains the model from the database
+       .find_similar()      — finds crimes similar to a given incident
+       .predict()           — ranks possible serial-group labels for a new incident
+       .load() / _save()    — saves/loads the model to/from disk
+  4. compute_hotspot_summary — clusters crime locations using DBSCAN
 
-PARAMETER CONTRACT FIX:
-  compute_hotspot_summary() now accepts `eps_km` and `min_samples` keyword
-  arguments so that HotspotView can use the adaptive-DBSCAN ladder without
-  passing those kwargs to a function that previously didn't accept them.
+Bug fixes in this version
+--------------------------
+  • compute_hotspot_summary now accepts `eps_km` and `min_samples` keyword
+    arguments so the adaptive-DBSCAN loop in HotspotView works correctly.
+  • compute_time_series now maps the single-letter freq codes ("D", "W", "M")
+    that TimeSeriesRequestSerializer sends, in addition to the long-form names.
 """
 
 import pickle
@@ -21,71 +27,93 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-# Path to the persisted Random Forest model file.
-# Lives inside the Django app folder alongside this module.
+# Where the trained Random Forest model gets saved on disk.
+# The folder "ml_models/" lives inside the Django app package folder.
 RF_MODEL_PATH = Path(__file__).parent / "ml_models" / "profile_matcher.pkl"
 
 
 # =============================================================================
-# 1. KDE Heatmap
+# 1. KDE Heatmap  —  "How dense are crimes in each area of the map?"
 # =============================================================================
 
-def compute_kde_heatmap(coordinates: list, grid_size: int = 100,
-                        bandwidth: float = 0.05) -> dict:
+def compute_kde_heatmap(coordinates, grid_size=100, bandwidth=0.05):
     """
-    Convert a list of (lat, lng) crime locations into a density heatmap.
+    Takes a list of (latitude, longitude) crime locations and returns
+    a grid of density values for drawing a heatmap on the frontend map.
+
+    How it works:
+      - We fit a Kernel Density Estimator (KDE) to the crime coordinates.
+        Think of KDE as placing a small "bump" at each crime location and
+        then adding all the bumps together.  Where many crimes cluster, the
+        bumps add up to a high peak.  Sparse areas stay low.
+      - We then evaluate the density on a regular grid of points across
+        the bounding box of the data.
+      - We normalise the density to a 0-1 scale so the frontend always gets
+        consistent intensity values regardless of the number of crimes.
 
     Parameters
     ----------
     coordinates : list of (lat, lng) tuples
-    grid_size   : number of grid cells per axis (higher = finer resolution)
-    bandwidth   : KDE bandwidth in degrees (~0.05° ≈ 5 km near Harare)
+    grid_size   : how many grid cells per axis (higher = finer detail)
+    bandwidth   : controls how wide each "bump" is, in degrees
+                  (~0.05° ≈ 5 km around Harare's latitude)
 
     Returns
     -------
-    dict  {"points": [{"lat":…, "lng":…, "intensity": 0-1}, …],
-           "max_intensity": float}
+    {
+      "points": [ {"lat": ..., "lng": ..., "intensity": 0.0-1.0}, ... ],
+      "max_intensity": float   # raw peak density before normalisation
+    }
     """
     from sklearn.neighbors import KernelDensity
 
+    # Nothing to do if there are no coordinates
     if not coordinates:
         return {"points": [], "max_intensity": 0}
 
-    # Stack (lat, lng) pairs into a (N, 2) numpy array
+    # Convert list of tuples to a 2D numpy array  shape: (N, 2)
     coords = np.array(coordinates)
 
-    # Fit a Gaussian kernel to the crime locations.
-    # bandwidth controls how wide the "bump" around each point is.
+    # Fit the KDE to the crime locations.
+    # KernelDensity learns where the data is dense vs sparse.
     kde = KernelDensity(bandwidth=bandwidth, kernel="gaussian")
     kde.fit(coords)
 
-    # Build a uniform grid across the bounding box of the data
+    # Build a regular grid that covers the entire dataset area.
     lat_min, lat_max = coords[:, 0].min(), coords[:, 0].max()
     lng_min, lng_max = coords[:, 1].min(), coords[:, 1].max()
 
+    # linspace creates evenly-spaced points between the min and max.
     lat_grid = np.linspace(lat_min, lat_max, grid_size)
     lng_grid = np.linspace(lng_min, lng_max, grid_size)
 
-    # meshgrid produces all (lat, lng) combinations on the grid
+    # meshgrid turns two 1-D arrays into all (lat, lng) combinations on the
+    # grid.  grid_lat and grid_lng are both (grid_size × grid_size) matrices.
     grid_lat, grid_lng = np.meshgrid(lat_grid, lng_grid)
+
+    # Flatten and zip the two matrices into a list of (lat, lng) points so we
+    # can score all grid cells in one call  shape: (grid_size², 2)
     grid_points = np.column_stack([grid_lat.ravel(), grid_lng.ravel()])
 
-    # score_samples returns log-density; exponentiate to recover density
+    # ---- Score every grid cell with the KDE --------------------------------
+    # KernelDensity.score_samples() returns log(density) for numerical
+    # stability.  We exponentiate to get the actual density value.
     log_density = kde.score_samples(grid_points)
-    density = np.exp(log_density)
+    density     = np.exp(log_density)
 
-    # Normalise to [0, 1] so intensity is consistent across different maps
+    # ---- Normalise density to the range [0, 1] ----------------------------
     max_density = density.max() if density.max() > 0 else 1.0
-    normalised = density / max_density
+    normalised  = density / max_density
 
-    # Drop cells below 5 % of peak to keep the response payload small
+    # ---- Filter out near-zero cells to keep the API response small --------
+    # Any cell with less than 5% of peak intensity is not worth sending.
     threshold = 0.05
-    mask = normalised > threshold
+    mask      = normalised > threshold
 
     points = [
         {
-            "lat": float(grid_points[i, 0]),
-            "lng": float(grid_points[i, 1]),
+            "lat":       float(grid_points[i, 0]),
+            "lng":       float(grid_points[i, 1]),
             "intensity": round(float(normalised[i]), 4),
         }
         for i in np.where(mask)[0]
@@ -95,149 +123,164 @@ def compute_kde_heatmap(coordinates: list, grid_size: int = 100,
 
 
 # =============================================================================
-# 2. Time Series Decomposition
+# 2. Time Series Decomposition  —  "What are the trends in crime over time?"
 # =============================================================================
 
-# Map the short frequency codes sent by the serializer to pandas resample rules
-# and human-readable labels.
-FREQ_MAP = {
-    # Short codes accepted by TimeSeriesRequestSerializer
-    "D":  ("D",      "daily"),
-    "W":  ("W-MON",  "weekly"),
-    "M":  ("MS",     "monthly"),
-    # Long names accepted by the management command / direct calls
-    "daily":   ("D",      "daily"),
-    "weekly":  ("W-MON",  "weekly"),
-    "monthly": ("MS",     "monthly"),
+# ── Frequency code mapping ────────────────────────────────────────────────────
+# TimeSeriesRequestSerializer sends single-letter codes ("D", "W", "M").
+# The old code only accepted long-form names and always fell through to the
+# default.  This combined map handles BOTH forms so nothing is ever silently
+# ignored.
+_FREQ_MAP = {
+    # Long-form names (legacy / direct calls)
+    "daily":   ("D",       14),   # (pandas resample code, min periods for decompose)
+    "weekly":  ("W-MON",    4),
+    "monthly": ("MS",       4),
+    # Short codes sent by the serializer
+    "D":       ("D",       14),
+    "W":       ("W-MON",    4),
+    "M":       ("MS",       4),
 }
 
 
-def compute_time_series(df: pd.DataFrame, period: str = "W") -> dict:
+def compute_time_series(df, period="W"):
     """
-    Count crime incidents per time bucket and decompose the series into
-    trend, seasonal, and residual components.
+    Counts crime incidents per time period and decomposes the count series
+    into three components:
+      - trend    : long-term direction (going up or down overall?)
+      - seasonal : repeating patterns (e.g. more crime on weekends)
+      - residual : what remains after trend and seasonal are removed (noise)
+
+    This uses the "additive" model: observed = trend + seasonal + residual
 
     Parameters
     ----------
-    df     : DataFrame with at least a 'timestamp' column
-    period : frequency code — 'D', 'W', 'M'  (or long-form equivalents)
+    df     : DataFrame with at least a 'timestamp' column (one row per crime)
+    period : frequency code — accepts "D"/"W"/"M" (from serializer) OR
+             "daily"/"weekly"/"monthly" (long-form).  Defaults to "W".
 
     Returns
     -------
-    dict with keys: labels, observed, trend, seasonal, residual,
-                    period_label, total_incidents, [note]
+    dict with lists for each component, suitable for JSON serialisation.
     """
     from statsmodels.tsa.seasonal import seasonal_decompose
 
-    # Resolve short / long frequency codes to pandas rule + display label
-    rule, period_label = FREQ_MAP.get(period, ("W-MON", "weekly"))
+    # Look up the pandas resample code and minimum-periods threshold.
+    # .upper() normalises "w" → "W" etc. just in case.
+    freq_rule, min_periods = _FREQ_MAP.get(
+        period,
+        _FREQ_MAP.get(str(period).upper(), ("W-MON", 4)),
+    )
 
-    # Parse timestamps and set as the index for resampling
-    df = df.copy()
+    # Parse the timestamp column and set it as the DataFrame index.
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    ts = df.set_index("timestamp").resample(rule).size()
 
-    # Remove timezone info — statsmodels does not support tz-aware DatetimeIndex
+    # resample().size() counts how many crimes fall into each time bucket.
+    ts = df.set_index("timestamp").resample(freq_rule).size()
+
+    # Remove timezone info — statsmodels does not support timezone-aware indexes.
     ts.index = ts.index.tz_localize(None)
-    ts = ts.asfreq(rule, fill_value=0)   # fill gaps with 0 (no crimes)
+
+    # Fill any missing time periods with 0 (no crimes that period).
+    ts = ts.asfreq(freq_rule, fill_value=0)
 
     labels   = ts.index.strftime("%Y-%m-%d").tolist()
     observed = ts.tolist()
 
-    # Minimum periods needed per frequency for a reliable decomposition
-    min_needed = {"daily": 14, "weekly": 4, "monthly": 4}
-    min_len    = min_needed.get(period_label, 4)
-
-    if len(ts) < min_len * 2:
+    # seasonal_decompose needs at least 2 full cycles of data to work.
+    if len(ts) < min_periods * 2:
         return {
-            "labels": labels,
-            "observed": observed,
-            "trend": None,
-            "seasonal": None,
-            "residual": None,
-            "period_label": period_label,
-            "total_incidents": int(ts.sum()),
-            "note": "Not enough data for seasonal decomposition.",
+            "labels":           labels,
+            "observed":         observed,
+            "trend":            None,
+            "seasonal":         None,
+            "residual":         None,
+            "period_label":     period,
+            "total_incidents":  int(ts.sum()),
+            "note":             "Not enough data for seasonal decomposition.",
         }
 
-    # Additive decomposition: observed = trend + seasonal + residual
     decomposition = seasonal_decompose(
         ts,
         model="additive",
-        period=min_len,
-        extrapolate_trend="freq",  # fills NaN edges of the trend component
+        period=min_periods,
+        extrapolate_trend="freq",   # fill NaN at the edges of the trend component
     )
 
-    def _to_list(series: pd.Series) -> list:
-        """Convert pandas Series → Python list, replacing NaN with None."""
+    def series_to_list(series):
+        """
+        Convert a pandas Series to a plain Python list.
+        NaN values (at the start/end of trend and residual) become None so
+        they serialise cleanly as JSON null.
+        """
         return [None if np.isnan(v) else round(float(v), 4) for v in series]
 
     return {
-        "labels":           labels,
-        "observed":         observed,
-        "trend":            _to_list(decomposition.trend),
-        "seasonal":         _to_list(decomposition.seasonal),
-        "residual":         _to_list(decomposition.resid),
-        "period_label":     period_label,
-        "total_incidents":  int(ts.sum()),
+        "labels":          labels,
+        "observed":        observed,
+        "trend":           series_to_list(decomposition.trend),
+        "seasonal":        series_to_list(decomposition.seasonal),
+        "residual":        series_to_list(decomposition.resid),
+        "period_label":    period,
+        "total_incidents": int(ts.sum()),
     }
 
 
 # =============================================================================
-# 3. ProfileMatcher  — Random Forest serial-crime classifier
+# 3. ProfileMatcher  —  "Which crimes were likely committed by the same person?"
 # =============================================================================
 
 class ProfileMatcher:
     """
-    Trains a Random Forest to link crimes into serial groups and, at
-    inference time, finds the most similar incidents to a query case.
+    A Random Forest classifier that learns to match crimes into serial groups.
 
-    Training features
-    -----------------
-    • TF-IDF vector from modus_operandi text (up to 300 features)
-    • One-hot encodings: crime type, time of day, day of week, weapon used
+    What it does:
+      - During training: learns from crimes that analysts have labelled with a
+        'serial_group_label' (e.g. "GROUP_A", "GROUP_B").
+      - During inference: given a new crime, predicts which group it most
+        likely belongs to, or finds the most textually-similar crimes.
 
-    Usage
-    -----
-    Offline:   ProfileMatcher().train(labelled_queryset)
-    Online:    ProfileMatcher.load().find_similar(incident, top_n=5)
+    Features used:
+      - TF-IDF text vector from the modus_operandi field
+      - One-hot encoding of: crime type, time of day, day of week, weapon used
     """
 
     def __init__(self):
-        self.rf      = None   # trained RandomForestClassifier
-        self.tfidf   = None   # fitted TfidfVectorizer
+        # The trained Random Forest classifier (set after .train() is called)
+        self.rf = None
 
-        # Vocabulary / class lists saved at training time so inference
-        # always produces feature vectors with exactly the same shape
-        self.crime_type_classes_: list = []
-        self.tod_classes_: list        = []
-        self.dow_classes_: list        = []
-        self.weapon_classes_: list     = []
+        # TF-IDF vectoriser fitted on modus operandi text during training.
+        # Saved so we can apply the same vocabulary at inference time.
+        self.tfidf = None
 
-    # ------------------------------------------------------------------
+        # The unique values seen during training for each categorical column.
+        # Saved so one-hot encoding at inference always has the same layout.
+        self.crime_type_classes_ = []
+        self.tod_classes_        = []   # time-of-day categories
+        self.dow_classes_        = []   # day-of-week categories
+        self.weapon_classes_     = []
+
+    # -------------------------------------------------------------------------
     # Training
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
 
-    def train(self, incidents_qs) -> dict:
+    def train(self, incidents_qs):
         """
-        Fit the Random Forest on labelled CrimeIncidents.
+        Train the Random Forest on all labelled crime incidents.
 
         Parameters
         ----------
-        incidents_qs : QuerySet of CrimeIncident objects,
-                       all having a non-empty serial_group_label
+        incidents_qs : Django QuerySet of CrimeIncident objects that all have a
+                       non-empty serial_group_label.
 
         Returns
         -------
-        dict  {"status", "n_samples", "n_classes", "cv_accuracy_mean",
-               "cv_accuracy_std"}  or  {"error": <message>}
+        dict with accuracy metrics, e.g. {"cv_accuracy_mean": 0.87, ...}
         """
         from sklearn.ensemble import RandomForestClassifier
         from sklearn.feature_extraction.text import TfidfVectorizer
         from sklearn.model_selection import cross_val_score
 
-        # Pull only the columns we need from the DB to avoid loading
-        # heavy geometry or binary fields unnecessarily
         data = list(incidents_qs.values(
             "id",
             "modus_operandi",
@@ -255,27 +298,31 @@ class ProfileMatcher:
         df = df[df["serial_group_label"].str.strip() != ""].copy()
 
         if df.empty:
-            return {"error": "No incidents with serial_group_label found after filtering."}
+            return {"error": "No incidents with serial_group_label found."}
 
-        # ── Feature 1: TF-IDF on modus operandi text ─────────────────────
-        # max_features=300 keeps the vector small; ngram_range=(1,2) also
-        # captures two-word phrases like "smash and grab".
+        # ---- Feature 1: TF-IDF on modus operandi free text -----------------
+        # TF-IDF converts each text description into a numeric vector.
+        # Words rare across all descriptions (and thus more distinctive) get a
+        # higher weight.  max_features=300 keeps the vector compact;
+        # ngram_range=(1,2) also captures two-word phrases like "smash and grab".
         self.tfidf = TfidfVectorizer(
-            max_features=300, ngram_range=(1, 2), stop_words="english"
+            max_features=300,
+            ngram_range=(1, 2),
+            stop_words="english",
         )
-        # fit_transform learns the vocabulary AND encodes all training texts
         mo_matrix = self.tfidf.fit_transform(
             df["modus_operandi"].fillna("")
-        ).toarray()
+        ).toarray()  # .toarray() converts sparse matrix to dense numpy array
 
-        # ── Feature 2: One-hot encode categorical columns ─────────────────
-        # Store class lists so inference vectors have the same column count
+        # ---- Feature 2: One-hot encode categorical columns ------------------
+        # One-hot encoding turns a category like "morning" into a binary
+        # column: [1, 0, 0, 0] means "morning", [0, 1, 0, 0] means
+        # "afternoon", etc.
         self.crime_type_classes_ = sorted(
             df["crime_type__name"].dropna().unique().tolist()
         )
-        # Time-of-day and day-of-week have fixed, known categories
-        self.tod_classes_ = ["morning", "afternoon", "evening", "night"]
-        self.dow_classes_ = [
+        self.tod_classes_    = ["morning", "afternoon", "evening", "night"]
+        self.dow_classes_    = [
             "monday", "tuesday", "wednesday", "thursday",
             "friday", "saturday", "sunday",
         ]
@@ -283,141 +330,155 @@ class ProfileMatcher:
             df["weapon_used"].fillna("").unique().tolist()
         )
 
-        def _ohe_series(series: pd.Series, classes: list) -> np.ndarray:
-            """One-hot encode an entire column → (N, len(classes)) array."""
+        def one_hot_encode_series(series, classes):
+            """
+            Encode a whole pandas Series as a one-hot matrix.
+            Returns a 2-D numpy array of shape (len(series), len(classes)).
+            Each row has a 1 in the column matching its value, 0s elsewhere.
+            """
             return np.array(
                 [[1 if val == c else 0 for c in classes] for val in series]
             )
 
-        ct_ohe  = _ohe_series(df["crime_type__name"].fillna(""), self.crime_type_classes_)
-        tod_ohe = _ohe_series(df["time_of_day"].fillna(""),       self.tod_classes_)
-        dow_ohe = _ohe_series(df["day_of_week"].fillna(""),       self.dow_classes_)
-        wp_ohe  = _ohe_series(df["weapon_used"].fillna(""),       self.weapon_classes_)
+        ct_ohe     = one_hot_encode_series(df["crime_type__name"].fillna(""), self.crime_type_classes_)
+        tod_ohe    = one_hot_encode_series(df["time_of_day"].fillna(""),       self.tod_classes_)
+        dow_ohe    = one_hot_encode_series(df["day_of_week"].fillna(""),       self.dow_classes_)
+        weapon_ohe = one_hot_encode_series(df["weapon_used"].fillna(""),       self.weapon_classes_)
 
-        # Concatenate all feature groups side-by-side into one wide matrix
-        X = np.hstack([mo_matrix, ct_ohe, tod_ohe, dow_ohe, wp_ohe])
+        # ---- Combine all features into one big matrix ----------------------
+        # np.hstack glues the matrices side by side:
+        # [TF-IDF columns | crime_type columns | time_of_day columns | ...]
+        X = np.hstack([mo_matrix, ct_ohe, tod_ohe, dow_ohe, weapon_ohe])
         y = df["serial_group_label"].values
 
-        # ── Train the Random Forest ───────────────────────────────────────
+        # ---- Train the Random Forest ----------------------------------------
         self.rf = RandomForestClassifier(
-            n_estimators=200, max_depth=None, random_state=42, n_jobs=-1
+            n_estimators=200,
+            max_depth=None,
+            random_state=42,
+            n_jobs=-1,          # use all available CPU cores
         )
 
-        # Cross-validate for an honest accuracy estimate before fitting on all data
-        n_folds  = min(3, len(df) // 5 or 1)
+        # cross_val_score splits the data into folds, trains on each fold,
+        # and tests on the remaining fold to get an honest accuracy estimate
+        # without needing a separate test set.
+        n_folds   = min(3, len(df) // 5 or 1)
         cv_scores = cross_val_score(self.rf, X, y, cv=n_folds, scoring="accuracy")
 
-        # Final fit on the complete dataset
+        # Now train on ALL the data (cross-val was just for measuring accuracy).
         self.rf.fit(X, y)
         self._save()
 
         return {
-            "status":            "trained",
-            "n_samples":         len(df),
-            "n_classes":         len(self.rf.classes_),
-            "classes":           self.rf.classes_.tolist(),
-            "cv_accuracy_mean":  round(float(cv_scores.mean()), 4),
-            "cv_accuracy_std":   round(float(cv_scores.std()), 4),
+            "status":             "trained",
+            "n_samples":          len(df),
+            "n_classes":          len(self.rf.classes_),
+            "classes":            self.rf.classes_.tolist(),
+            "cv_accuracy_mean":   round(float(cv_scores.mean()), 4),
+            "cv_accuracy_std":    round(float(cv_scores.std()), 4),
         }
 
-    # ------------------------------------------------------------------
-    # Feature vector construction (shared by predict() and find_similar())
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Feature building  —  used by both predict() and find_similar()
+    # -------------------------------------------------------------------------
 
     def _build_feature_vector(
-        self,
-        mo_text: str,
-        crime_type_name: str,
-        time_of_day: str,
-        day_of_week: str,
-        weapon_used: str,
-    ) -> np.ndarray:
+        self, mo_text, crime_type_name, time_of_day, day_of_week, weapon_used
+    ):
         """
-        Build the same (1, n_features) feature vector used at training time.
-        Uses transform() — NOT fit_transform() — so the training vocabulary
-        is re-used unchanged at inference.
+        Turn a single crime's attributes into the same numeric feature vector
+        format used during training.
+
+        This MUST mirror the feature engineering in train() exactly — calling
+        transform() (not fit_transform()) so we reuse the learned vocabulary.
+
+        Returns a (1, n_features) numpy array.
         """
-        # TF-IDF encode the single MO text string using the training vocabulary
         mo_vec = self.tfidf.transform([mo_text]).toarray()
 
-        def _ohe_single(value: str, classes: list) -> np.ndarray:
-            """One-hot encode a single value → (1, len(classes)) array."""
+        def one_hot_single(value, classes):
+            """
+            Encode ONE value as a one-hot vector of shape (1, len(classes)).
+            Example: one_hot_single("morning", ["morning","afternoon","evening","night"])
+                     → [[1, 0, 0, 0]]
+            """
             return np.array([[1 if value == c else 0 for c in classes]])
 
-        ct_ohe  = _ohe_single(crime_type_name, self.crime_type_classes_)
-        tod_ohe = _ohe_single(time_of_day,     self.tod_classes_)
-        dow_ohe = _ohe_single(day_of_week,     self.dow_classes_)
-        wp_ohe  = _ohe_single(weapon_used,     self.weapon_classes_)
+        ct_ohe  = one_hot_single(crime_type_name, self.crime_type_classes_)
+        tod_ohe = one_hot_single(time_of_day,     self.tod_classes_)
+        dow_ohe = one_hot_single(day_of_week,     self.dow_classes_)
+        wp_ohe  = one_hot_single(weapon_used,     self.weapon_classes_)
 
+        # Glue all feature groups into one row vector  shape: (1, total_features)
         return np.hstack([mo_vec, ct_ohe, tod_ohe, dow_ohe, wp_ohe])
 
-    # ------------------------------------------------------------------
-    # Inference — predict serial group for a new crime description
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Inference: predict serial group labels for a new crime
+    # -------------------------------------------------------------------------
 
     def predict(
-        self,
-        mo_text: str,
-        crime_type_name: str,
-        time_of_day: str,
-        day_of_week: str,
-        weapon_used: str,
-        top_n: int = 5,
-    ) -> list:
+        self, mo_text, crime_type_name, time_of_day, day_of_week, weapon_used, top_n=5
+    ):
         """
-        Return the top_n most likely serial group labels and their probabilities.
+        Given attributes of a crime, return the most likely serial group labels
+        ranked by probability.
 
-        Returns
-        -------
-        list of {"group_label": str, "probability": float}
+        Returns a list like:
+          [{"group_label": "GROUP_A", "probability": 0.72}, ...]
+        Only groups with probability > 1% are included.
         """
         if self.rf is None:
-            raise RuntimeError("Model not trained yet. Call train() first.")
+            raise RuntimeError("Model not trained yet.  Call train() first.")
 
-        X = self._build_feature_vector(
+        X      = self._build_feature_vector(
             mo_text, crime_type_name, time_of_day, day_of_week, weapon_used
         )
 
-        # predict_proba returns shape (1, n_classes); [0] extracts the 1-D array
+        # predict_proba() returns a probability for each known group label.
+        # probas shape: (1, n_classes) → [0] gives the 1-D array.
         probas  = self.rf.predict_proba(X)[0]
         classes = self.rf.classes_
 
-        # Sort by probability descending, keep only top_n with > 1 % confidence
-        ranked = sorted(zip(classes, probas), key=lambda p: p[1], reverse=True)
+        ranked = sorted(zip(classes, probas), key=lambda pair: pair[1], reverse=True)
+
         return [
-            {"group_label": lbl, "probability": round(float(prob), 4)}
-            for lbl, prob in ranked[:top_n]
+            {"group_label": label, "probability": round(float(prob), 4)}
+            for label, prob in ranked[:top_n]
             if prob > 0.01
         ]
 
-    # ------------------------------------------------------------------
-    # Inference — find most similar incidents by TF-IDF cosine similarity
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Inference: find similar incidents to a given one
+    # -------------------------------------------------------------------------
 
-    def find_similar(self, incident, top_n: int = 5) -> list:
+    def find_similar(self, incident, top_n=5):
         """
-        Return PKs of the top_n incidents most similar to *incident* using
-        cosine similarity on TF-IDF encoded modus operandi text.
+        Given a CrimeIncident database object, find the PKs of the top_n most
+        textually similar incidents using TF-IDF cosine similarity on the
+        modus_operandi text.
+
+        Cosine similarity measures how "close" two text vectors are in
+        direction (ignoring length), so two crimes described similarly score
+        high regardless of text length.
 
         Parameters
         ----------
-        incident : CrimeIncident ORM object (needs .pk and .modus_operandi)
+        incident : a CrimeIncident Django ORM instance
         top_n    : how many similar incident PKs to return
 
         Returns
         -------
         list of integer PKs (excluding the query incident itself)
         """
-        # Lazy import to avoid circular references at module load
         from .models import CrimeIncident
         from sklearn.metrics.pairwise import cosine_similarity as cos_sim
 
-        # The model must be loaded (tfidf fitted) before calling find_similar()
         if self.tfidf is None:
-            instance = self.__class__.load()
-            return instance.find_similar(incident, top_n=top_n)
+            raise RuntimeError(
+                "TF-IDF vectoriser not available.  "
+                "Run train_profile_matcher management command first."
+            )
 
-        # Fetch all other incidents that have some MO text to compare against
         candidates = list(
             CrimeIncident.objects
             .exclude(pk=incident.pk)
@@ -428,90 +489,93 @@ class ProfileMatcher:
         if not candidates:
             return []
 
-        # Encode the query incident's MO text using the TRAINING vocabulary
+        # Encode the query crime's MO text using the TRAINING vocabulary
         query_vec = self.tfidf.transform([incident.modus_operandi or ""])
 
-        # Encode all candidates in one batch call for efficiency
-        cand_texts = [c["modus_operandi"] or "" for c in candidates]
-        cand_vecs  = self.tfidf.transform(cand_texts)
+        # Encode all candidate MO texts in one batch call (efficient)
+        candidate_texts = [c["modus_operandi"] or "" for c in candidates]
+        candidate_vecs  = self.tfidf.transform(candidate_texts)
 
-        # cosine_similarity returns (1, N); flatten to 1-D for easy sorting
-        similarities = cos_sim(query_vec, cand_vecs).flatten()
+        # cosine_similarity returns shape (1, N); .flatten() gives a 1-D array
+        similarities = cos_sim(query_vec, candidate_vecs).flatten()
 
-        # argsort ascending; reverse and slice to get top_n descending
+        # argsort ascending → [::-1] reverses to descending → [:top_n] keeps top
         top_indices = np.argsort(similarities)[::-1][:top_n]
+
         return [candidates[i]["id"] for i in top_indices]
 
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # Persistence
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
 
     def _save(self):
-        """Serialise the entire fitted ProfileMatcher to disk via pickle."""
+        """Serialise this ProfileMatcher object to disk using pickle."""
         RF_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(RF_MODEL_PATH, "wb") as f:
             pickle.dump(self, f)
-        logger.info("ProfileMatcher saved → %s", RF_MODEL_PATH)
+        logger.info("ProfileMatcher saved to %s", RF_MODEL_PATH)
 
     @classmethod
-    def load(cls) -> "ProfileMatcher":
+    def load(cls):
         """
-        Deserialise a previously saved ProfileMatcher from disk.
-
-        Raises
-        ------
-        FileNotFoundError if train() has never been called.
+        Load a previously saved ProfileMatcher from disk.
+        Raises FileNotFoundError if train() has never been run.
         """
         if not RF_MODEL_PATH.exists():
             raise FileNotFoundError(
-                "Profile matcher model not found. "
-                "Run: python manage.py train_profile_matcher  "
-                "(or POST /api/zrp/ml/train/)"
+                "Profile matcher model not found.  "
+                "Run: python manage.py train_profile_matcher"
             )
         with open(RF_MODEL_PATH, "rb") as f:
             instance = pickle.load(f)
-        logger.info("ProfileMatcher loaded ← %s", RF_MODEL_PATH)
+        logger.info("ProfileMatcher loaded from %s", RF_MODEL_PATH)
         return instance
 
     @classmethod
     def load_and_predict(
         cls, mo_text, crime_type_name, time_of_day, day_of_week, weapon_used, top_n=5
-    ) -> list:
-        """Convenience: load model from disk then call predict()."""
-        return cls.load().predict(
+    ):
+        """Convenience: load the model from disk, then call predict()."""
+        matcher = cls.load()
+        return matcher.predict(
             mo_text, crime_type_name, time_of_day, day_of_week, weapon_used, top_n
         )
 
 
 # =============================================================================
-# 4. Hotspot Summary  — DBSCAN spatial clustering
+# 4. Hotspot Summary  —  "Where are the crime hotspots?"
 # =============================================================================
 
 def compute_hotspot_summary(
-    coordinates: list,
-    crime_types: list,
-    suburbs: list,
-    eps_km: float = 0.5,
-    min_samples: int = 3,
-) -> list:
+    coordinates,
+    crime_types,
+    suburbs,
+    eps_km=0.5,
+    min_samples=3,
+):
     """
-    Cluster crime locations into hotspot zones using DBSCAN and return a
-    summary of each cluster.
+    Groups crime locations into spatial clusters (hotspots) using DBSCAN,
+    then summarises each cluster with a centroid, radius, and crime breakdown.
 
     Parameters
     ----------
-    coordinates  : list of (lat, lng) tuples — one per incident
-    crime_types  : list of str — dominant crime type per incident
-    suburbs      : list of str — suburb name per incident
-    eps_km       : DBSCAN neighbourhood radius in kilometres (default 0.5 km)
-    min_samples  : DBSCAN minimum points to form a cluster (default 3)
+    coordinates  : list of (lat, lng) tuples
+    crime_types  : list of crime type strings, same length as coordinates
+    suburbs      : list of suburb strings, same length as coordinates
+    eps_km       : maximum radius of a DBSCAN neighbourhood in kilometres.
+                   Default 0.5 km (500 m).  HotspotView passes progressively
+                   larger values when no clusters are found at the tighter radius.
+    min_samples  : minimum number of crimes required to form a cluster.
+                   Default 3.  HotspotView reduces this to 2 on the looser passes.
+
+    DBSCAN notes:
+      - Groups points that are close to each other into clusters.
+      - Points that are far from any cluster are labelled "noise" (label = -1).
+      - Unlike k-means, you do NOT need to specify the number of clusters.
 
     Returns
     -------
-    list of hotspot dicts, sorted by incident count descending.
-    Each dict contains:
-        cluster_id, centre_lat, centre_lng, radius_m, incident_count,
-        risk_level, area (dominant crime type), suburb (dominant suburb)
+    list of hotspot dicts, each containing centroid, radius, count, etc.
     """
     from sklearn.cluster import DBSCAN
 
@@ -520,71 +584,79 @@ def compute_hotspot_summary(
 
     coords = np.array(coordinates)
 
-    # Convert (lat, lng) from degrees to radians — required by the haversine metric
+    # ---- Convert degrees to radians for the Haversine distance metric ------
+    # Haversine measures real-world distance on the Earth's curved surface.
+    # DBSCAN needs radians when metric="haversine".
     coords_rad = np.radians(coords)
 
-    # Convert eps from kilometres to radians using Earth radius 6371 km
+    # ---- Convert the km radius to radians for DBSCAN -----------------------
+    # Earth radius ≈ 6371 km.  eps_km / 6371 gives the radian equivalent.
     eps_rad = eps_km / 6371.0
 
-    # Fit DBSCAN.
-    # algorithm="ball_tree" + metric="haversine" gives proper spherical distances
-    # so clusters respect real-world geography rather than flat Euclidean distance.
     dbscan = DBSCAN(
         eps=eps_rad,
         min_samples=min_samples,
         algorithm="ball_tree",
-        metric="haversine",
+        metric="haversine",     # proper spherical distance
     )
     cluster_labels = dbscan.fit_predict(coords_rad)
 
-    hotspots = []
-    unique_labels = sorted(set(cluster_labels))
+    # ---- Summarise each cluster ---------------------------------------------
+    hotspots      = []
+    unique_labels = set(cluster_labels)
 
     for label in unique_labels:
+        # Label -1 means "noise" — crimes too isolated to form a hotspot
         if label == -1:
-            # DBSCAN uses -1 for "noise" points that don't belong to any cluster
             continue
 
-        # Boolean mask: True for every crime assigned to this cluster
-        mask = cluster_labels == label
+        # Boolean mask: True for every crime that belongs to this cluster
+        mask           = cluster_labels == label
         cluster_coords = coords[mask]
 
-        # Centroid = mean of latitudes and longitudes within the cluster
-        centre_lat = float(cluster_coords[:, 0].mean())
-        centre_lng = float(cluster_coords[:, 1].mean())
+        # Centroid = average lat and lng of all crimes in the cluster
+        centroid_lat = float(cluster_coords[:, 0].mean())
+        centroid_lng = float(cluster_coords[:, 1].mean())
 
-        # Radius = maximum distance from centroid to any member (degrees → metres)
-        dists_deg = np.sqrt(
-            (cluster_coords[:, 0] - centre_lat) ** 2 +
-            (cluster_coords[:, 1] - centre_lng) ** 2
+        # Radius = furthest Euclidean distance (in degrees) from centroid,
+        # converted to approximate metres (1 degree ≈ 111 km)
+        distances_from_centroid = np.sqrt(
+            (cluster_coords[:, 0] - centroid_lat) ** 2
+            + (cluster_coords[:, 1] - centroid_lng) ** 2
         )
-        radius_m = float(dists_deg.max() * 111_000)  # 1° ≈ 111 km
+        radius_m = float(distances_from_centroid.max() * 111_000)
 
-        # Count incidents per crime type within the cluster
+        # Count occurrences of each crime type in this hotspot cluster
         cluster_crime_types = [
-            crime_types[i] for i, flag in enumerate(mask) if flag
+            crime_types[i] for i, in_cluster in enumerate(mask) if in_cluster
         ]
-        ct_counts: dict = {}
+        crime_type_counts: dict[str, int] = {}
         for ct in cluster_crime_types:
-            ct_counts[ct] = ct_counts.get(ct, 0) + 1
+            crime_type_counts[ct] = crime_type_counts.get(ct, 0) + 1
 
-        # Dominant crime type (most frequent)
-        dominant_ct = max(ct_counts, key=ct_counts.get) if ct_counts else "Unknown"
-
-        # Dominant suburb (most frequent non-empty)
+        # Find the most common suburb name in this hotspot
         cluster_suburbs = [
-            suburbs[i] for i, flag in enumerate(mask) if flag and suburbs[i]
+            suburbs[i] for i, in_cluster in enumerate(mask) if in_cluster
         ]
-        if cluster_suburbs:
-            sb_counts: dict = {}
-            for s in cluster_suburbs:
-                sb_counts[s] = sb_counts.get(s, 0) + 1
-            dominant_suburb = max(sb_counts, key=sb_counts.get)
+        non_empty_suburbs = [s for s in cluster_suburbs if s]
+        if non_empty_suburbs:
+            suburb_counts: dict[str, int] = {}
+            for s in non_empty_suburbs:
+                suburb_counts[s] = suburb_counts.get(s, 0) + 1
+            dominant_suburb = max(suburb_counts, key=suburb_counts.get)
         else:
             dominant_suburb = "Unknown"
 
-        # Assign a risk level based on cluster size.
-        # These thresholds can be tuned to ZRP operational needs.
+        # Dominant crime type = the one that appears most frequently
+        dominant_crime = (
+            max(crime_type_counts, key=crime_type_counts.get)
+            if crime_type_counts
+            else "Unknown"
+        )
+
+        # ---- Risk level classification based on incident count --------------
+        # These thresholds are designed for a single-city dataset like Harare.
+        # Adjust as the data volume grows.
         count = int(mask.sum())
         if count >= 20:
             risk_level = "Critical"
@@ -596,21 +668,19 @@ def compute_hotspot_summary(
             risk_level = "Low"
 
         hotspots.append({
-            "cluster_id":     int(label),
-            # "area" carries the dominant crime type label
-            # (matches the column name the frontend Analytics component reads)
-            "area":           dominant_ct,
-            # "suburb" carries the dominant location name
-            "suburb":         dominant_suburb,
-            "incident_count": count,
-            "risk_level":     risk_level,
-            # Centroid coordinates — used by the Leaflet map in Analytics.jsx
-            "centre_lat":     round(centre_lat, 6),
-            "centre_lng":     round(centre_lng, 6),
-            "radius_m":       round(radius_m, 1),
-            "crime_type_breakdown": ct_counts,
+            "cluster_id":           int(label),
+            # "area" is used as the dominant crime type column by HotspotView
+            "area":                 dominant_crime,
+            # "suburb" is used as the location/place-name column by HotspotView
+            "suburb":               dominant_suburb,
+            "centre_lat":           round(centroid_lat, 6),
+            "centre_lng":           round(centroid_lng, 6),
+            "radius_m":             round(radius_m, 1),
+            "incident_count":       count,
+            "risk_level":           risk_level,
+            "crime_type_breakdown": crime_type_counts,
         })
 
-    # Largest clusters first so the table rows are pre-sorted
+    # Sort hotspots by number of crimes, largest first
     hotspots.sort(key=lambda h: h["incident_count"], reverse=True)
     return hotspots

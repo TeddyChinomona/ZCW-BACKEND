@@ -18,7 +18,7 @@ Views that need analyst-or-above use IsZRPAnalystOrAdmin.
 Views that need admin-only use IsZRPAdmin.
 """
 from rest_framework.permissions import BasePermission, IsAuthenticated
-
+from loguru import logger
 
 class IsZRPAuthenticated(IsAuthenticated):
     """
@@ -53,7 +53,7 @@ class IsZRPAdmin(IsAuthenticated):
             return False
         return (
             hasattr(request.user, "role") and
-            request.user.role == "admin"
+            request.user.role == "admin" or "officer"  # Officers can also create incidents via RRB form
         )
 
 
@@ -77,10 +77,10 @@ class IsZRPAnalystOrAdmin(IsAuthenticated):
             return False
 
         role = request.user.role
-
+        logger.debug(f"User role: {role} | Method: {request.method} | Path: {request.path}")
         # Read-only access is fine for all ZRP roles (officers can view analytics)
         if request.method in ("GET", "HEAD", "OPTIONS"):
             return True
 
         # Write access requires at least analyst role
-        return role in ("analyst", "admin")
+        return role in ("analyst", "admin", "officer")  # Officers can also create incidents via RRB form

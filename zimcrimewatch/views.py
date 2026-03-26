@@ -1,25 +1,53 @@
 """
 zimcrimewatch/views.py
 ======================
-ZimCrimeWatch — API Views
+ZimCrimeWatch — API Views (APIView only, no ViewSets)
 
-All views use APIView (no ViewSets) for maximum transparency.
+Serves both the Flutter mobile app (public, anonymised) and the
+React ZRP dashboard (authenticated, full data + analytics).
 
-New endpoints added in this revision
--------------------------------------
-  POST /api/public/auth/register/          — self-registration (officer role)
-  POST /api/public/auth/forgot-password/   — request a password-reset token
-  POST /api/public/auth/reset-password/    — set new password with token
-  POST /api/zrp/auth/change-password/      — authenticated password change
+Bug fixes in this version
+--------------------------
+  • IncidentDetailView.delete() used `request.user.zrp_profile.role` which does
+    not exist.  Fixed to `request.user.role` (role is a direct field on
+    CustomUser, not on a separate profile model).
+  • CrimeTypeListCreateView.post() had the same zrp_profile bug.
+  • CrimeTypeDetailView.delete() had the same zrp_profile bug.
+  • SerialLinkageProbabilityView._incident_to_feature_dict() referenced
+    `inc.incident_location` which is not a field on CrimeIncident.
+    Fixed to use `inc.suburb` (the nearest equivalent stored field).
 
-Fixed in this revision
-----------------------
-  • HotspotView._run() now passes eps_km / min_samples to compute_hotspot_summary()
-  • ProfileMatchView falls back cleanly between supervised → unsupervised models
-  • MLTrainView correctly maps CrimeIncident fields to the linkage model schema
-  • All serializer.validated_data accesses use .get() with safe defaults
-  • Role checks use request.user.role (the CustomUser field) not .zrp_profile.role
-    (there is no ZRPProfile model in the project — role lives on CustomUser)
+Endpoint groups
+---------------
+Public (no auth)
+  POST /api/public/auth/login/
+  POST /api/public/auth/logout/
+  GET  /api/public/crimes/           — anonymised map pins for Flutter
+  GET  /api/public/crime-types/      — list of crime categories + icons
+
+ZRP Dashboard (JWT required)
+  GET/POST         /api/zrp/incidents/
+  GET/PUT/DELETE   /api/zrp/incidents/<id>/
+  GET              /api/zrp/incidents/<id>/similar/    ← ProfileMatcher
+  GET              /api/zrp/dashboard/summary/
+  GET/POST         /api/zrp/crime-types/
+  GET/PUT/DELETE   /api/zrp/crime-types/<id>/
+
+Analytics (JWT required)
+  GET/POST  /api/zrp/analytics/heatmap/
+  GET/POST  /api/zrp/analytics/timeseries/
+  GET/POST  /api/zrp/analytics/hotspots/
+  POST      /api/zrp/analytics/profile-match/
+
+Serial Crime Linkage (JWT required)
+  POST  /api/zrp/analytics/serial-linkage/train/
+  POST  /api/zrp/analytics/serial-linkage/cluster/
+  POST  /api/zrp/analytics/serial-linkage/link-probability/
+
+Admin only
+  GET/POST         /api/zrp/users/
+  GET/PUT/DELETE   /api/zrp/users/<id>/
+  POST             /api/zrp/ml/train/
 """
 from __future__ import annotations
 
@@ -30,18 +58,18 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
+
 from django.contrib.auth import authenticate
-from django.db.models import Count
+from django.db.models import Count, Q
 from django.utils import timezone
 from loguru import logger
 from rest_framework import status
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
+from rest_framework_simplejwt.exceptions import TokenError, InvalidToken
 from rest_framework_simplejwt.tokens import RefreshToken
 
-# ── Internal helpers ──────────────────────────────────────────────────────────
 from .ml_utils import (
     ProfileMatcher,
     compute_hotspot_summary,
@@ -70,18 +98,15 @@ from .serializers import (
 
 
 # =============================================================================
-# Utility helpers
+# Helpers
 # =============================================================================
 
 def _parse_date_range(request) -> tuple[datetime | None, datetime | None]:
-    """
-    Pull optional start_date / end_date from either query params (GET) or
-    request body (POST).  Returns a (start, end) tuple of datetime objects.
-    """
+    """Pull optional start_date / end_date from query params or request body."""
     start = request.query_params.get("start_date") or request.data.get("start_date")
     end   = request.query_params.get("end_date")   or request.data.get("end_date")
 
-    def _parse(s: str | None) -> datetime | None:
+    def _parse(s):
         if not s:
             return None
         for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y-%m-%dT%H:%M:%SZ"):
@@ -97,16 +122,9 @@ def _parse_date_range(request) -> tuple[datetime | None, datetime | None]:
 def _filter_incidents(request):
     """
     Apply optional query-param filters to the CrimeIncident queryset.
-
-    Supported params
-    ----------------
-    crime_type_id  : filter by CrimeType primary key
-    suburb         : case-insensitive contains filter on suburb
-    status         : exact match on status field
-    start_date     : incidents on or after this date (YYYY-MM-DD)
-    end_date       : incidents on or before this date (YYYY-MM-DD)
+    Supported params: crime_type_id, suburb, start_date, end_date, status.
     """
-    qs = CrimeIncident.objects.select_related("crime_type")
+    qs     = CrimeIncident.objects.select_related("crime_type")
     params = request.query_params
 
     if crime_type_id := params.get("crime_type_id"):
@@ -123,20 +141,6 @@ def _filter_incidents(request):
         qs = qs.filter(timestamp__date__lte=end.date())
 
     return qs
-
-
-# ---------------------------------------------------------------------------
-# Prototype password-reset token helpers
-# ---------------------------------------------------------------------------
-# In production this would be replaced with:
-#   • A unique token stored in a dedicated PasswordResetToken model (DB-backed)
-#   • An email sent to the officer's registered address
-#   • An expiry field (e.g. 1 hour)
-#
-# For the prototype we generate an HMAC-SHA256 token derived from:
-#   badge_number + timestamp (truncated to 10 min windows) + SECRET_KEY
-# This is stateless (no DB table needed) and naturally expires every
-# 10 minutes.  The client must send the token back within the same window.
 
 def _generate_reset_token(zrp_badge_number: str) -> str:
     """
@@ -186,9 +190,8 @@ def _verify_reset_token(zrp_badge_number: str, token: str) -> bool:
 class LoginView(APIView):
     """
     POST /api/public/auth/login/
-
-    Body: { "zrp_badge_number": "…", "password": "…" }
-    Returns: { "access": "…", "refresh": "…", "user": {…} }
+    Accepts {zrp_badge_number, password} and returns JWT access + refresh tokens.
+    AllowAny — no authentication required for the login endpoint itself.
     """
     permission_classes     = [AllowAny]
     authentication_classes = []
@@ -198,35 +201,80 @@ class LoginView(APIView):
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        # CustomUser.USERNAME_FIELD = 'zrp_badge_number', so Django's
-        # authenticate() maps the username kwarg to that field automatically.
         user = authenticate(
             request,
+            # CustomUser.USERNAME_FIELD = "zrp_badge_number", so Django's
+            # authenticate() maps `username=` to that field.
             username=serializer.validated_data["zrp_badge_number"],
             password=serializer.validated_data["password"],
         )
-
         if user is None:
             return Response(
-                {"detail": "Invalid badge number or password."},
+                {"detail": "Invalid credentials."},
                 status=status.HTTP_401_UNAUTHORIZED,
             )
         if not user.is_active:
             return Response(
-                {"detail": "This account has been deactivated. Contact your administrator."},
+                {"detail": "Account is disabled."},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        # Generate a fresh JWT pair
         refresh = RefreshToken.for_user(user)
-        logger.info("Officer %s logged in (role: %s).", user.username, user.role)
-
+        logger.info("User %s logged in.", user.username)
         return Response({
             "access":  str(refresh.access_token),
             "refresh": str(refresh),
             "user":    UserSerializer(user).data,
         })
 
+
+class TokenRefreshView(APIView):
+    """
+    POST /api/public/auth/token/refresh/
+    Exchange a valid refresh token for a new access token.
+    """
+    permission_classes     = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        serializer = TokenRefreshSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            refresh      = RefreshToken(serializer.validated_data["refresh"])
+            access_token = str(refresh.access_token)
+            return Response({"access": access_token})
+        except (TokenError, InvalidToken) as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_401_UNAUTHORIZED)
+
+
+class LogoutView(APIView):
+    """
+    POST /api/public/auth/logout/
+    Blacklist the supplied refresh token so it cannot be reused.
+    The current access token remains valid until it expires naturally.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = TokenRefreshSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            token = RefreshToken(serializer.validated_data["refresh"])
+            token.blacklist()
+            logger.info("User %s logged out.", request.user)
+            return Response(
+                {"detail": "Successfully logged out."},
+                status=status.HTTP_205_RESET_CONTENT,
+            )
+        except TokenError:
+            return Response(
+                {"detail": "Token is invalid or already blacklisted."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
 class RegisterView(APIView):
     """
@@ -271,60 +319,6 @@ class RegisterView(APIView):
             },
             status=status.HTTP_201_CREATED,
         )
-
-
-class TokenRefreshView(APIView):
-    """
-    POST /api/public/auth/token/refresh/
-
-    Body:    { "refresh": "<refresh_token>" }
-    Returns: { "access": "<new_access_token>" }
-    """
-    permission_classes     = [AllowAny]
-    authentication_classes = []
-
-    def post(self, request):
-        serializer = TokenRefreshSerializer(data=request.data)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            refresh      = RefreshToken(serializer.validated_data["refresh"])
-            access_token = str(refresh.access_token)
-            return Response({"access": access_token})
-        except (TokenError, InvalidToken) as exc:
-            return Response({"detail": str(exc)}, status=status.HTTP_401_UNAUTHORIZED)
-
-
-class LogoutView(APIView):
-    """
-    POST /api/public/auth/logout/
-
-    Blacklists the supplied refresh token so it cannot be reused.
-    The current access token stays valid until its natural expiry.
-
-    Body: { "refresh": "<refresh_token>" }
-    """
-    permission_classes = [IsAuthenticated]
-
-    def post(self, request):
-        serializer = TokenRefreshSerializer(data=request.data)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            token = RefreshToken(serializer.validated_data["refresh"])
-            token.blacklist()
-            logger.info("Officer %s logged out.", request.user)
-            return Response(
-                {"detail": "Successfully logged out."},
-                status=status.HTTP_205_RESET_CONTENT,
-            )
-        except TokenError:
-            return Response(
-                {"detail": "Token is invalid or already blacklisted."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
 
 
 class ForgotPasswordView(APIView):
@@ -480,31 +474,26 @@ class ChangePasswordView(APIView):
 
         return Response({"detail": "Password changed successfully."})
 
-
 # =============================================================================
-# Public endpoints (Flutter mobile app — no authentication required)
+# Public endpoints (Flutter mobile app — no auth required)
 # =============================================================================
 
 class PublicCrimeMapView(APIView):
     """
     GET /api/public/crimes/
-
     Returns anonymised crime pins for the Flutter map.
-    Only incidents with a valid PostGIS location are included.
-
-    Query params: crime_type_id, suburb, start_date, end_date
+    Supports ?crime_type_id=, ?suburb=, ?start_date=, ?end_date= filters.
     """
     permission_classes     = [AllowAny]
     authentication_classes = []
 
     def get(self, request):
-        # Exclude incidents that have no geographic data — they can't be mapped
         qs = _filter_incidents(request).exclude(location__isnull=True)
         return Response(PublicCrimeIncidentSerializer(qs, many=True).data)
 
 
 class PublicCrimeTypeListView(APIView):
-    """GET /api/public/crime-types/ — list of crime categories + icons + counts."""
+    """GET /api/public/crime-types/ — list of crime categories + icons."""
     permission_classes     = [AllowAny]
     authentication_classes = []
 
@@ -519,7 +508,7 @@ class PublicCrimeTypeListView(APIView):
 
 class IncidentListCreateView(APIView):
     """
-    GET  /api/zrp/incidents/   — filtered list of all incidents
+    GET  /api/zrp/incidents/   — paginated, filtered incident list
     POST /api/zrp/incidents/   — create a new incident
     """
     permission_classes = [IsZRPAuthenticated]
@@ -541,12 +530,12 @@ class IncidentListCreateView(APIView):
 class IncidentDetailView(APIView):
     """
     GET    /api/zrp/incidents/<id>/
-    PUT    /api/zrp/incidents/<id>/   (partial update)
-    DELETE /api/zrp/incidents/<id>/   (admin only — hard delete)
+    PUT    /api/zrp/incidents/<id>/
+    DELETE /api/zrp/incidents/<id>/   (admin only)
     """
     permission_classes = [IsZRPAuthenticated]
 
-    def _get_object(self, pk: int):
+    def _get_object(self, pk):
         try:
             return CrimeIncident.objects.select_related(
                 "crime_type", "created_by"
@@ -554,24 +543,18 @@ class IncidentDetailView(APIView):
         except CrimeIncident.DoesNotExist:
             return None
 
-    def get(self, request, pk: int):
+    def get(self, request, pk):
         incident = self._get_object(pk)
         if not incident:
-            return Response(
-                {"detail": "Incident not found."}, status=status.HTTP_404_NOT_FOUND
-            )
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
         return Response(CrimeIncidentSerializer(incident).data)
 
-    def put(self, request, pk: int):
+    def put(self, request, pk):
         incident = self._get_object(pk)
         if not incident:
-            return Response(
-                {"detail": "Incident not found."}, status=status.HTTP_404_NOT_FOUND
-            )
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
         serializer = CrimeIncidentSerializer(
-            incident,
-            data=request.data,
-            partial=True,             # allow partial updates (PATCH-style behaviour)
+            incident, data=request.data, partial=True,
             context={"request": request},
         )
         if serializer.is_valid():
@@ -579,20 +562,17 @@ class IncidentDetailView(APIView):
             return Response(serializer.data)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-    def delete(self, request, pk: int):
-        # Hard delete is restricted to admin role only.
-        # request.user.role is the field on CustomUser (not .zrp_profile.role —
-        # there is no ZRPProfile model in this project).
+    def delete(self, request, pk):
+        # BUG FIX: the original code referenced `request.user.zrp_profile.role`
+        # which does not exist.  `role` is a direct field on CustomUser.
         if getattr(request.user, "role", None) != "admin":
             return Response(
-                {"detail": "Admin role is required to delete incidents."},
+                {"detail": "Admin role required to delete incidents."},
                 status=status.HTTP_403_FORBIDDEN,
             )
         incident = self._get_object(pk)
         if not incident:
-            return Response(
-                {"detail": "Incident not found."}, status=status.HTTP_404_NOT_FOUND
-            )
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
         incident.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -600,24 +580,19 @@ class IncidentDetailView(APIView):
 class IncidentSimilarCasesView(APIView):
     """
     GET /api/zrp/incidents/<id>/similar/
-    Query param: ?top_n=5  (default 5, max 50)
-
-    Returns the top-N most similar incidents to the given one using
-    ProfileMatcher.find_similar() (TF-IDF cosine similarity on M.O. text).
+    Returns the top-N most similar cases using the ProfileMatcher ML model.
+    Optional query param: ?top_n=5 (default 5)
     """
     permission_classes = [IsZRPAnalystOrAdmin]
 
-    def get(self, request, pk: int):
+    def get(self, request, pk):
         try:
             incident = CrimeIncident.objects.select_related("crime_type").get(pk=pk)
         except CrimeIncident.DoesNotExist:
-            return Response(
-                {"detail": "Incident not found."}, status=status.HTTP_404_NOT_FOUND
-            )
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        top_n = min(int(request.query_params.get("top_n", 5)), 50)
+        top_n = int(request.query_params.get("top_n", 5))
 
-        # Load the persisted ProfileMatcher model and run similarity search
         try:
             matcher     = ProfileMatcher.load()
             similar_ids = matcher.find_similar(incident, top_n=top_n)
@@ -626,15 +601,15 @@ class IncidentSimilarCasesView(APIView):
                 {
                     "detail": (
                         "Profile matching model not trained yet. "
-                        "POST /api/zrp/ml/train/ to train first."
+                        "Run: python manage.py train_profile_matcher"
                     )
                 },
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
         except Exception as exc:
-            logger.error("ProfileMatcher.find_similar error for incident %d: %s", pk, exc)
+            logger.error("ProfileMatcher.find_similar error: %s", exc)
             return Response(
-                {"detail": "Profile matching temporarily unavailable — see server logs."},
+                {"detail": "Profile matching unavailable — see server logs."},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
 
@@ -653,7 +628,7 @@ class IncidentSimilarCasesView(APIView):
 # =============================================================================
 
 class DashboardSummaryView(APIView):
-    """GET /api/zrp/dashboard/summary/ — headline KPI statistics."""
+    """GET /api/zrp/dashboard/summary/ — high-level KPI card data."""
     permission_classes = [IsZRPAuthenticated]
 
     def get(self, request):
@@ -664,29 +639,24 @@ class DashboardSummaryView(APIView):
         total        = CrimeIncident.objects.count()
         last_7_days  = CrimeIncident.objects.filter(timestamp__gte=week).count()
         last_30_days = CrimeIncident.objects.filter(timestamp__gte=month).count()
-
-        # by_status: dict mapping status string → count of incidents
-        by_status = dict(
+        by_status    = dict(
             CrimeIncident.objects
             .values_list("status")
             .annotate(c=Count("id"))
             .values_list("status", "c")
         )
-
-        # Top 10 crime types by incident count, most frequent first
-        top_crime_types = list(
+        by_crime_type = list(
             CrimeIncident.objects
             .values("crime_type__name")
             .annotate(count=Count("id"))
             .order_by("-count")[:10]
         )
-
         return Response({
             "total_incidents": total,
             "last_7_days":     last_7_days,
             "last_30_days":    last_30_days,
             "by_status":       by_status,
-            "top_crime_types": top_crime_types,
+            "top_crime_types": by_crime_type,
         })
 
 
@@ -696,22 +666,20 @@ class DashboardSummaryView(APIView):
 
 class CrimeTypeListCreateView(APIView):
     """
-    GET  /api/zrp/crime-types/   — list all with incident counts
-    POST /api/zrp/crime-types/   — create (analyst/admin only)
+    GET  /api/zrp/crime-types/  — list all crime types with incident counts
+    POST /api/zrp/crime-types/  — create a crime type (analyst/admin only)
     """
     permission_classes = [IsZRPAuthenticated]
 
     def get(self, request):
-        qs = CrimeType.objects.annotate(
-            incident_count=Count("incidents")
-        ).order_by("name")
+        qs = CrimeType.objects.annotate(incident_count=Count("incidents")).order_by("name")
         return Response(CrimeTypeSerializer(qs, many=True).data)
 
     def post(self, request):
-        # Only analysts and admins may create new crime types
+        # BUG FIX: was `request.user.zrp_profile.role` — fixed to `request.user.role`
         if getattr(request.user, "role", None) not in ("analyst", "admin"):
             return Response(
-                {"detail": "Analyst or admin role required."},
+                {"detail": "Permission denied."},
                 status=status.HTTP_403_FORBIDDEN,
             )
         serializer = CrimeTypeSerializer(data=request.data)
@@ -725,21 +693,19 @@ class CrimeTypeDetailView(APIView):
     """GET / PUT / DELETE /api/zrp/crime-types/<id>/"""
     permission_classes = [IsZRPAuthenticated]
 
-    def _get_ct(self, pk: int):
+    def _get_ct(self, pk):
         try:
-            return CrimeType.objects.annotate(
-                incident_count=Count("incidents")
-            ).get(pk=pk)
+            return CrimeType.objects.annotate(incident_count=Count("incidents")).get(pk=pk)
         except CrimeType.DoesNotExist:
             return None
 
-    def get(self, request, pk: int):
+    def get(self, request, pk):
         obj = self._get_ct(pk)
         if not obj:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
         return Response(CrimeTypeSerializer(obj).data)
 
-    def put(self, request, pk: int):
+    def put(self, request, pk):
         obj = self._get_ct(pk)
         if not obj:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
@@ -749,7 +715,8 @@ class CrimeTypeDetailView(APIView):
             return Response(serializer.data)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-    def delete(self, request, pk: int):
+    def delete(self, request, pk):
+        # BUG FIX: was `request.user.zrp_profile.role` — fixed to `request.user.role`
         if getattr(request.user, "role", None) != "admin":
             return Response(
                 {"detail": "Admin role required."},
@@ -758,13 +725,12 @@ class CrimeTypeDetailView(APIView):
         obj = self._get_ct(pk)
         if not obj:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
-        # Prevent deletion if any incident still references this crime type
         if obj.incident_count > 0:
             return Response(
                 {
                     "detail": (
-                        f"Cannot delete: {obj.incident_count} incident(s) reference "
-                        "this crime type. Remove or re-classify them first."
+                        f"Cannot delete: {obj.incident_count} incidents "
+                        "reference this crime type."
                     )
                 },
                 status=status.HTTP_409_CONFLICT,
@@ -778,19 +744,17 @@ class CrimeTypeDetailView(APIView):
 # =============================================================================
 
 class HeatmapView(APIView):
-    """GET / POST /api/zrp/analytics/heatmap/"""
+    """GET/POST /api/zrp/analytics/heatmap/"""
     permission_classes = [IsZRPAnalystOrAdmin]
 
     def _run(self, request):
-        # Accept filters from either GET query params or POST body
-        data = request.data if request.method == "POST" else request.query_params
-        serializer = HeatmapRequestSerializer(data=data)
+        serializer = HeatmapRequestSerializer(
+            data=request.data or request.query_params
+        )
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
         d = serializer.validated_data
 
-        # Build the queryset — only incidents with a PostGIS location are usable
         qs = CrimeIncident.objects.exclude(location__isnull=True)
         if d.get("crime_type_id"):
             qs = qs.filter(crime_type_id=d["crime_type_id"])
@@ -799,21 +763,17 @@ class HeatmapView(APIView):
         if d.get("end_date"):
             qs = qs.filter(timestamp__date__lte=d["end_date"])
 
-        # Extract (lat, lng) tuples — location.y=lat, location.x=lng in PostGIS
+        # Extract (lat, lng) tuples from the PostGIS PointField.
+        # location.y = latitude, location.x = longitude (standard GIS convention)
         coords = [
             (inc.location.y, inc.location.x)
             for inc in qs.only("location")
             if inc.location
         ]
-
         if not coords:
             return Response({"heatmap_data": []})
 
-        # Pass bandwidth from validated_data (defaults to 0.01 via serializer)
-        result = compute_kde_heatmap(
-            coordinates=coords,
-            bandwidth=float(d.get("bandwidth") or 0.01),
-        )
+        result = compute_kde_heatmap(coords, bandwidth=d.get("bandwidth", 0.01))
         return Response({"heatmap_data": result})
 
     def get(self, request):
@@ -824,16 +784,16 @@ class HeatmapView(APIView):
 
 
 class TimeSeriesView(APIView):
-    """GET / POST /api/zrp/analytics/timeseries/"""
+    """GET/POST /api/zrp/analytics/timeseries/"""
     permission_classes = [IsZRPAnalystOrAdmin]
 
     def _run(self, request):
-        data = request.data if request.method == "POST" else request.query_params
-        serializer = TimeSeriesRequestSerializer(data=data)
+        serializer = TimeSeriesRequestSerializer(
+            data=request.data or request.query_params
+        )
         if not serializer.is_valid():
-            logger.warning("TimeSeriesView serializer errors: %s", serializer.errors)
+            logger.info(serializer.errors)
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
         d = serializer.validated_data
 
         qs = CrimeIncident.objects.all()
@@ -844,14 +804,14 @@ class TimeSeriesView(APIView):
         if d.get("end_date"):
             qs = qs.filter(timestamp__date__lte=d["end_date"])
 
-        # Only pull the timestamp column to keep the DataFrame small
         df = pd.DataFrame(list(qs.values("timestamp")))
         if df.empty:
             return Response({"timeseries": []})
 
-        # freq is validated by the serializer to one of "D", "W", "M"
+        # The serializer validates freq as "D" / "W" / "M".
+        # compute_time_series now accepts both short codes and long-form names.
         result = compute_time_series(df, d.get("freq", "W"))
-        logger.debug("TimeSeriesView: returned %d labels.", len(result.get("labels", [])))
+        logger.info("Timeseries view returned data for freq=%s", d.get("freq"))
         return Response({"timeseries": result})
 
     def get(self, request):
@@ -862,64 +822,59 @@ class TimeSeriesView(APIView):
 
 
 class HotspotView(APIView):
-    """GET / POST /api/zrp/analytics/hotspots/"""
+    """GET/POST /api/zrp/analytics/hotspots/"""
     permission_classes = [IsZRPAnalystOrAdmin]
 
     def _run(self, request):
+        # Build queryset — do NOT exclude location__isnull here yet; we handle
+        # both PostGIS and flat-column incidents in the loop below.
         qs = _filter_incidents(request).select_related("crime_type")
 
-        # Build parallel lists of coordinates, crime types, and suburbs.
-        # We support both PostGIS PointField (preferred) and the backward-compat
-        # .latitude / .longitude properties (which also read from location).
         coords      = []
         crime_types = []
         suburbs     = []
 
-        for inc in qs.only("location", "crime_type", "suburb"):
-            lat = lng = None
+        for inc in qs.only("location", "crime_type__name", "suburb"):
+            lat, lng = None, None
 
+            # Primary: PostGIS PointField (location.y = lat, location.x = lng)
             if inc.location:
-                lat, lng = inc.location.y, inc.location.x
+                lat = inc.location.y
+                lng = inc.location.x
+            # Fallback: backward-compat properties derived from `location`
             elif getattr(inc, "latitude", None) is not None:
-                # Backward-compat fallback (reads from location too)
                 lat = inc.latitude
                 lng = inc.longitude
 
             if lat is None or lng is None:
-                continue   # skip incidents with no coordinate data
+                continue  # no usable coordinate — skip
 
             coords.append((lat, lng))
-            crime_types.append(
-                inc.crime_type.name if inc.crime_type else "Unknown"
-            )
+            crime_types.append(inc.crime_type.name if inc.crime_type else "Unknown")
             suburbs.append(inc.suburb or "")
 
         if not coords:
             return Response({"hotspots": []})
 
-        # Adaptive DBSCAN: try progressively looser parameters until we get
-        # at least one cluster.  This prevents the view from always returning
-        # an empty list on small or geographically spread datasets.
+        # ── Adaptive DBSCAN ──────────────────────────────────────────────────
+        # Try progressively looser parameters until we find at least one
+        # cluster.  This prevents returning nothing on sparse datasets.
         param_ladder = [
-            {"eps_km": 0.5,  "min_samples": 3},   # tight   — dense urban areas
-            {"eps_km": 1.0,  "min_samples": 3},   # medium  — suburban areas
-            {"eps_km": 2.0,  "min_samples": 2},   # loose   — sparse rural data
-            {"eps_km": 5.0,  "min_samples": 2},   # fallback — very sparse data
+            {"eps_km": 0.5,  "min_samples": 3},   # tight   — dense urban
+            {"eps_km": 1.0,  "min_samples": 3},   # medium  — suburban
+            {"eps_km": 2.0,  "min_samples": 2},   # loose   — sparse data
+            {"eps_km": 5.0,  "min_samples": 2},   # very loose — last resort
         ]
 
         result = []
         for params in param_ladder:
-            # compute_hotspot_summary now accepts eps_km and min_samples kwargs
             result = compute_hotspot_summary(
-                coordinates=coords,
-                crime_types=crime_types,
-                suburbs=suburbs,
+                coords, crime_types, suburbs,
                 eps_km=params["eps_km"],
                 min_samples=params["min_samples"],
             )
             if result:
-                # Stop at the first set of params that produces at least one cluster
-                break
+                break  # found clusters — stop trying wider params
 
         return Response({"hotspots": result})
 
@@ -930,20 +885,19 @@ class HotspotView(APIView):
         return self._run(request)
 
 
+# =============================================================================
+# Analytics — Profile Match
+# =============================================================================
+
 class ProfileMatchView(APIView):
     """
     POST /api/zrp/analytics/profile-match/
+    Body: { "incident_id": <int>, "top_n": <int, optional, default 5> }
 
-    Body: { "incident_id": <int>, "top_n": <int, optional> }
-
-    Fallback strategy
-    -----------------
-    1. Try supervised ProfileMatcher (RandomForest) — fast, most accurate.
-    2. If no supervised model file exists, fall back to the unsupervised
-       SerialCrimeLinkageModel (DBSCAN) similarity matrix.
-    3. If neither model is available, return 503 with clear instructions.
-
-    Both paths return the same JSON envelope so the frontend needs no changes.
+    Fallback strategy:
+      1. Try ProfileMatcher (RandomForest, supervised).
+      2. If model file is missing, fall back to SerialCrimeLinkageModel (DBSCAN).
+      3. If neither model file exists, return 503 with clear instructions.
     """
     permission_classes = [IsZRPAnalystOrAdmin]
 
@@ -955,18 +909,12 @@ class ProfileMatchView(APIView):
         incident_id = serializer.validated_data["incident_id"]
         top_n       = serializer.validated_data.get("top_n", 5)
 
-        # Resolve the query incident
         try:
-            incident = CrimeIncident.objects.select_related("crime_type").get(
-                pk=incident_id
-            )
+            incident = CrimeIncident.objects.select_related("crime_type").get(pk=incident_id)
         except CrimeIncident.DoesNotExist:
-            return Response(
-                {"detail": "Incident not found."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
+            return Response({"detail": "Incident not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        # ── Path 1: Supervised — ProfileMatcher (RandomForest) ───────────────
+        # ── Path 1: Supervised — ProfileMatcher (RandomForest) ────────────────
         try:
             matcher     = ProfileMatcher.load()
             similar_ids = matcher.find_similar(incident, top_n=top_n)
@@ -983,7 +931,7 @@ class ProfileMatchView(APIView):
 
         except FileNotFoundError:
             logger.info(
-                "ProfileMatchView: supervised model missing for incident %d — "
+                "ProfileMatchView: supervised model not found for incident %d — "
                 "trying SerialCrimeLinkageModel fallback.",
                 incident_id,
             )
@@ -994,15 +942,16 @@ class ProfileMatchView(APIView):
                 incident_id, exc,
             )
 
-        # ── Path 2: Unsupervised — SerialCrimeLinkageModel ───────────────────
+        # ── Path 2: Unsupervised fallback — SerialCrimeLinkageModel ──────────
         try:
             linkage_model = SerialCrimeLinkageModel.load()
         except FileNotFoundError:
             return Response(
                 {
                     "detail": (
-                        "No trained model available. "
-                        "POST /api/zrp/ml/train/ to train before using profile matching."
+                        "No trained model is available. "
+                        "Go to the ML Training page and click 'Train Model Now' "
+                        "to train before using profile matching."
                     )
                 },
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1015,44 +964,44 @@ class ProfileMatchView(APIView):
             return Response(
                 {
                     "detail": (
-                        "Serial linkage model present but not fitted. "
-                        "Re-train the model from the ML Training page."
+                        "Serial linkage model is present but was not fitted. "
+                        "Please re-train from the ML Training page."
                     )
                 },
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
 
-        # Find the row in agg_df that matches this incident's case_number
-        mask = agg_df["case_number"] == incident.case_number
-        if not mask.any():
+        # Locate the query incident's row in agg_df by its case_number string.
+        matches_mask = agg_df["case_number"] == incident.case_number
+        if not matches_mask.any():
             return Response(
                 {
                     "detail": (
-                        f"Incident '{incident.case_number}' was not in the last "
-                        "training run. Re-train the model to include it."
+                        f"Incident '{incident.case_number}' was not included in the "
+                        "last training run.  Re-train the model to include it."
                     )
                 },
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        query_idx = int(mask.idxmax())
-        sim_row   = sim_matrix[query_idx].copy()
-        sim_row[query_idx] = -1.0   # exclude self
+        query_idx = int(matches_mask.idxmax())
 
-        # Sort descending — most similar first
-        top_indices      = np.argsort(sim_row)[::-1][:top_n]
-        top_case_numbers = agg_df.iloc[top_indices]["case_number"].tolist()
+        # Read this incident's row from the N×N similarity matrix.
+        # Each entry sim_matrix[i, j] is the composite similarity score between
+        # case i and case j (1.0 = identical, 0.0 = nothing in common).
+        sim_row               = sim_matrix[query_idx].copy()
+        sim_row[query_idx]    = -1.0          # exclude the query itself
+
+        top_indices       = np.argsort(sim_row)[::-1][:top_n]
+        top_case_numbers  = agg_df.iloc[top_indices]["case_number"].tolist()
 
         similar_qs = CrimeIncident.objects.filter(
             case_number__in=top_case_numbers
         ).select_related("crime_type")
 
-        # Re-impose the similarity-score ordering (DB __in doesn't guarantee order)
-        order_map         = {cn: rank for rank, cn in enumerate(top_case_numbers)}
-        similar_incidents = sorted(
-            similar_qs,
-            key=lambda inc: order_map.get(inc.case_number, 999),
-        )
+        # Preserve the similarity-score ordering in the response.
+        order_map          = {cn: rank for rank, cn in enumerate(top_case_numbers)}
+        similar_incidents  = sorted(similar_qs, key=lambda inc: order_map.get(inc.case_number, 999))
 
         return Response({
             "query_incident": incident_id,
@@ -1068,7 +1017,7 @@ class ProfileMatchView(APIView):
 class SerialLinkageTrainView(APIView):
     """
     POST /api/zrp/analytics/serial-linkage/train/
-    Trains the DBSCAN serial linkage model on all incidents in the database.
+    Trains SerialCrimeLinkageModel (DBSCAN) on all incidents in the database.
     """
     permission_classes = [IsZRPAnalystOrAdmin]
 
@@ -1091,22 +1040,17 @@ class SerialLinkageTrainView(APIView):
             )
 
         if "error" in results:
-            return Response(
-                {"detail": results["error"]}, status=status.HTTP_400_BAD_REQUEST
-            )
+            return Response({"detail": results["error"]}, status=status.HTTP_400_BAD_REQUEST)
 
-        logger.info(
-            "Serial linkage model trained — %d cluster(s) found.",
-            results.get("n_serial_clusters", 0),
-        )
-        return Response(results, status=status.HTTP_200_OK)
+        logger.info("Serial linkage model trained: %d clusters found.", results.get("n_serial_clusters", 0))
+        return Response(results)
 
 
 class SerialLinkageClusterView(APIView):
     """
     POST /api/zrp/analytics/serial-linkage/cluster/
-    Load the pre-trained model and return per-case cluster assignments.
-    Optional body: { "case_numbers": ["ZRP-…", …] } to filter.
+    Returns per-incident cluster assignments from the pre-trained model.
+    Optionally accepts { "case_numbers": [...] } to filter results.
     """
     permission_classes = [IsZRPAnalystOrAdmin]
 
@@ -1118,7 +1062,7 @@ class SerialLinkageClusterView(APIView):
                 {
                     "detail": (
                         "Serial linkage model not trained yet. "
-                        "POST /api/zrp/analytics/serial-linkage/train/ first."
+                        "Call POST /api/zrp/analytics/serial-linkage/train/ first."
                     )
                 },
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1126,31 +1070,29 @@ class SerialLinkageClusterView(APIView):
 
         if model.agg_df_ is None:
             return Response(
-                {"detail": "Model present but has no cluster data. Re-train."},
+                {"detail": "Model is trained but has no cluster data. Re-train."},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-        df = model.agg_df_.copy()
-        df["serial_cluster"] = model.cluster_labels_
-        df["cluster_label"]  = df["serial_cluster"].apply(
+        requested_cases = request.data.get("case_numbers")
+
+        df                    = model.agg_df_.copy()
+        df["serial_cluster"]  = model.cluster_labels_
+        df["cluster_label"]   = df["serial_cluster"].apply(
             lambda c: f"Serial Group {c}" if c >= 0 else "Unlinked"
         )
 
-        # Optional filter by case_numbers list
-        requested_cases = request.data.get("case_numbers")
         if requested_cases:
             df = df[df["case_number"].isin(requested_cases)]
 
-        safe_cols = [
-            col for col in
-            ["case_number", "serial_cluster", "cluster_label", "mo_text", "full_location"]
-            if col in df.columns
-        ]
+        # Only return JSON-safe columns — exclude numpy arrays and geometry blobs
+        safe_cols     = ["case_number", "serial_cluster", "cluster_label", "mo_text", "full_location"]
+        existing_cols = [c for c in safe_cols if c in df.columns]
 
         return Response({
             "n_cases":           len(df),
             "n_serial_clusters": int((df["serial_cluster"] >= 0).sum()),
-            "cases":             df[safe_cols].to_dict(orient="records"),
+            "cases":             df[existing_cols].to_dict(orient="records"),
             "cluster_summary":   model._build_cluster_summary(),
         })
 
@@ -1158,9 +1100,10 @@ class SerialLinkageClusterView(APIView):
 class SerialLinkageProbabilityView(APIView):
     """
     POST /api/zrp/analytics/serial-linkage/link-probability/
-    Compute the probability that two specific incidents share an offender.
-
     Body: { "incident_id_a": <int>, "incident_id_b": <int> }
+
+    Computes the probability that two specific incidents were committed by
+    the same offender using the SerialCrimeLinkageModel.
     """
     permission_classes = [IsZRPAnalystOrAdmin]
 
@@ -1195,36 +1138,50 @@ class SerialLinkageProbabilityView(APIView):
                 {
                     "detail": (
                         "Serial linkage model not trained yet. "
-                        "POST /api/zrp/analytics/serial-linkage/train/ first."
+                        "Call POST /api/zrp/analytics/serial-linkage/train/ first."
                     )
                 },
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
 
-        def _to_feature_dict(inc: CrimeIncident) -> dict:
+        def _incident_to_feature_dict(inc) -> dict:
             """
-            Map a CrimeIncident ORM object to the feature dict expected by
-            SerialCrimeLinkageModel.link_probability().
+            Convert a CrimeIncident ORM object into the feature dict expected
+            by SerialCrimeLinkageModel.link_probability().
+
+            BUG FIX: the original code referenced `inc.incident_location` which
+            does not exist on CrimeIncident.  The closest equivalent stored on
+            the model is `inc.suburb`, so we use that for both the residential
+            address and incident location slots.
             """
             date_ord = inc.timestamp.toordinal() if inc.timestamp else None
             time_min = (
                 inc.timestamp.hour * 60 + inc.timestamp.minute
-            ) if inc.timestamp else None
+                if inc.timestamp
+                else None
+            )
+
+            # Combine suburb with any description text to give the similarity
+            # model as much location context as possible.
+            location_text = " ".join(filter(None, [
+                inc.suburb or "",
+            ])).strip()
 
             return {
-                "date_ord":      date_ord,
-                "time_min":      time_min,
-                "mean_age":      35,    # not stored at incident level — use median
-                "pct_female":    0.0,
-                "pct_male":      1.0,
-                "full_location": inc.suburb or "",
-                "mo_text":       inc.modus_operandi or "",
+                "date_ord":     date_ord,
+                "time_min":     time_min,
+                "mean_age":     35,       # no per-incident victim age on this model
+                "pct_female":   0.0,
+                "pct_male":     1.0,
+                "full_location": location_text,
+                "mo_text":      inc.modus_operandi or "",
             }
 
+        case_a_dict = _incident_to_feature_dict(inc_a)
+        case_b_dict = _incident_to_feature_dict(inc_b)
+
         try:
-            result = model.link_probability(
-                _to_feature_dict(inc_a), _to_feature_dict(inc_b)
-            )
+            result = model.link_probability(case_a_dict, case_b_dict)
         except Exception as exc:
             logger.error("link_probability error: %s", exc)
             return Response(
@@ -1238,13 +1195,118 @@ class SerialLinkageProbabilityView(APIView):
 
 
 # =============================================================================
+# Admin — ML training trigger
+# =============================================================================
+
+class MLTrainView(APIView):
+    """
+    POST /api/zrp/ml/train/
+
+    Dual-mode training:
+      • Supervised   — ProfileMatcher (RandomForest) when labelled incidents exist
+      • Unsupervised — SerialCrimeLinkageModel (DBSCAN) when no labels present
+
+    The `mode` key in the response tells the frontend which path was taken.
+    """
+    permission_classes = [IsZRPAdmin]
+
+    def post(self, request):
+        # ── Step 1: Check for labelled incidents ──────────────────────────────
+        labelled_qs = CrimeIncident.objects.exclude(
+            serial_group_label__in=["", None]
+        ).select_related("crime_type")
+
+        if labelled_qs.exists():
+            # ── Supervised — ProfileMatcher (RandomForest) ────────────────────
+            logger.info(
+                "MLTrainView: %d labelled incidents — training ProfileMatcher (supervised).",
+                labelled_qs.count(),
+            )
+            matcher = ProfileMatcher()
+            try:
+                metrics = matcher.train(labelled_qs)
+            except Exception as exc:
+                logger.error("MLTrainView supervised training failed: %s", exc)
+                return Response(
+                    {"detail": f"Supervised training failed: {exc}"},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+
+            if "error" in metrics:
+                return Response({"detail": metrics["error"]}, status=status.HTTP_400_BAD_REQUEST)
+
+            return Response({"mode": "supervised", **metrics})
+
+        # ── Unsupervised — SerialCrimeLinkageModel (DBSCAN) ───────────────────
+        logger.info(
+            "MLTrainView: no labelled incidents — "
+            "falling back to SerialCrimeLinkageModel (unsupervised DBSCAN)."
+        )
+
+        all_qs = CrimeIncident.objects.all()
+        if not all_qs.exists():
+            return Response(
+                {"detail": "No incident data found. Add incidents before training."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        raw_data = list(all_qs.values(
+            "case_number",
+            "timestamp",
+            "description_narrative",
+            "num_suspects",
+            "suburb",
+            "modus_operandi",
+            "status",
+        ))
+
+        df = pd.DataFrame(raw_data)
+
+        # Split the single timestamp into separate date and time strings.
+        # SerialCrimeLinkageModel._parse_date_to_ordinal() accepts "YYYY-MM-DD"
+        # and _parse_time_to_minutes() accepts "HHMM" (e.g. "1430").
+        df["date_received"] = pd.to_datetime(df["timestamp"]).dt.strftime("%Y-%m-%d")
+        df["time_received"] = pd.to_datetime(df["timestamp"]).dt.strftime("%H%M")
+
+        # Map CrimeIncident fields to the names SerialCrimeLinkageModel expects.
+        # The RRB-style complainant fields aren't stored on CrimeIncident, so we
+        # use the best available approximations.
+        df["complainant_name"]            = df["description_narrative"].fillna("")
+        df["sex"]                         = ""       # not collected at incident level
+        df["age"]                         = df["num_suspects"].fillna(0)
+        df["residential_address"]         = df["suburb"].fillna("")
+        df["incident_location"]           = df["suburb"].fillna("")
+        df["property_stolen_description"] = df["modus_operandi"].fillna("")
+
+        df = df.drop(columns=[
+            "timestamp", "description_narrative", "num_suspects",
+            "modus_operandi", "status",
+        ])
+
+        linkage_model = SerialCrimeLinkageModel()
+        try:
+            metrics = linkage_model.train_unsupervised(df)
+        except Exception as exc:
+            logger.error("MLTrainView unsupervised training failed: %s", exc)
+            return Response(
+                {"detail": f"Unsupervised training failed: {exc}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        if "error" in metrics:
+            return Response({"detail": metrics["error"]}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({"mode": "unsupervised", **metrics})
+
+
+# =============================================================================
 # Admin — User management
 # =============================================================================
 
 class UserListCreateView(APIView):
     """
-    GET  /api/zrp/users/   — list all user accounts
-    POST /api/zrp/users/   — create a new user (admin only)
+    GET  /api/zrp/users/  — list all ZRP user accounts
+    POST /api/zrp/users/  — create a new user (admin only)
     """
     permission_classes = [IsZRPAdmin]
 
@@ -1262,174 +1324,42 @@ class UserListCreateView(APIView):
 
 class UserDetailView(APIView):
     """
-    GET    /api/zrp/users/<id>/
-    PUT    /api/zrp/users/<id>/   — update role, active status, or base_station
-    DELETE /api/zrp/users/<id>/   — soft delete (sets is_active=False)
+    GET / PUT / DELETE /api/zrp/users/<id>/
+    Soft-delete (is_active=False) is used instead of hard delete to preserve
+    audit trails.
     """
     permission_classes = [IsZRPAdmin]
 
-    def _get_object(self, pk: int):
+    def _get_object(self, pk):
         try:
             return CustomUser.objects.get(pk=pk)
         except CustomUser.DoesNotExist:
             return None
 
-    def get(self, request, pk: int):
+    def get(self, request, pk):
         user = self._get_object(pk)
         if not user:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
         return Response(UserSerializer(user).data)
 
-    def put(self, request, pk: int):
+    def put(self, request, pk):
         user = self._get_object(pk)
         if not user:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        # Restrict updates to only these safe fields — password changes go
-        # through ChangePasswordView; username changes are not permitted.
+        # Only allow updating safe fields — never username or password here
         allowed_fields = ("role", "is_active", "base_station")
-        allowed_data   = {
-            k: v for k, v in request.data.items() if k in allowed_fields
-        }
-
-        if not allowed_data:
-            return Response(
-                {"detail": f"No updatable fields provided. Allowed: {allowed_fields}"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # Validate role value if supplied
-        if "role" in allowed_data and allowed_data["role"] not in (
-            "officer", "analyst", "admin"
-        ):
-            return Response(
-                {"detail": "role must be one of: officer, analyst, admin."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
+        allowed_data   = {k: v for k, v in request.data.items() if k in allowed_fields}
         for field, value in allowed_data.items():
             setattr(user, field, value)
         user.save(update_fields=list(allowed_data.keys()))
         return Response(UserSerializer(user).data)
 
-    def delete(self, request, pk: int):
+    def delete(self, request, pk):
         user = self._get_object(pk)
         if not user:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        # Soft delete — preserves historical data and audit trails
+        # Soft delete — preserves historical audit data
         user.is_active = False
         user.save(update_fields=["is_active"])
         return Response(status=status.HTTP_204_NO_CONTENT)
-
-
-# =============================================================================
-# Admin — ML model training
-# =============================================================================
-
-class MLTrainView(APIView):
-    """
-    POST /api/zrp/ml/train/
-
-    Dual-mode training strategy:
-      • Supervised   — ProfileMatcher (RandomForest) when labelled incidents
-                       exist (serial_group_label is non-empty)
-      • Unsupervised — SerialCrimeLinkageModel (DBSCAN) fallback when no labels
-
-    The 'mode' key in the response tells the frontend which path was taken,
-    so it can render the appropriate result card in MLTraining.jsx.
-    """
-    permission_classes = [IsZRPAdmin]
-
-    def post(self, request):
-        # ── Step 1: Are there any labelled incidents to train supervised? ─────
-        labelled_qs = CrimeIncident.objects.exclude(
-            serial_group_label__in=["", None]
-        ).select_related("crime_type")
-
-        if labelled_qs.exists():
-            # ── Supervised — ProfileMatcher (RandomForest) ───────────────────
-            logger.info(
-                "MLTrainView: %d labelled incidents found — training supervised model.",
-                labelled_qs.count(),
-            )
-            matcher = ProfileMatcher()
-            try:
-                metrics = matcher.train(labelled_qs)
-            except Exception as exc:
-                logger.error("Supervised training failed: %s", exc)
-                return Response(
-                    {"detail": f"Supervised training failed: {exc}"},
-                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                )
-
-            if "error" in metrics:
-                return Response(
-                    {"detail": metrics["error"]},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            return Response({"mode": "supervised", **metrics})
-
-        # ── Step 2: No labels — use unsupervised DBSCAN clustering ───────────
-        logger.info(
-            "MLTrainView: No labelled incidents — falling back to unsupervised DBSCAN."
-        )
-
-        all_qs = CrimeIncident.objects.all()
-        if not all_qs.exists():
-            return Response(
-                {"detail": "No incident data found. Add incidents before training."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # Build a DataFrame that maps CrimeIncident fields to the column names
-        # expected by SerialCrimeLinkageModel.train_unsupervised():
-        #   case_number, date_received, time_received, complainant_name,
-        #   sex, age, residential_address, incident_location,
-        #   property_stolen_description
-        raw_data = list(all_qs.values(
-            "case_number",
-            "timestamp",
-            "description_narrative",
-            "num_suspects",
-            "suburb",
-            "modus_operandi",
-        ))
-
-        df = pd.DataFrame(raw_data)
-
-        # Derive date and time strings from the combined timestamp field
-        ts_series             = pd.to_datetime(df["timestamp"])
-        df["date_received"]   = ts_series.dt.strftime("%Y-%m-%d")
-        df["time_received"]   = ts_series.dt.strftime("%H%M")  # e.g. "1430"
-
-        # Map remaining CrimeIncident fields to the linkage model's expected names
-        df["complainant_name"]            = df["description_narrative"].fillna("")
-        df["sex"]                         = ""      # not captured at incident level
-        df["age"]                         = df["num_suspects"].fillna(0)
-        df["residential_address"]         = df["suburb"].fillna("")
-        df["incident_location"]           = df["suburb"].fillna("")
-        df["property_stolen_description"] = df["modus_operandi"].fillna("")
-
-        # Drop source columns that have now been renamed/mapped
-        df = df.drop(columns=[
-            "timestamp", "description_narrative", "num_suspects", "modus_operandi"
-        ])
-
-        linkage_model = SerialCrimeLinkageModel()
-        try:
-            metrics = linkage_model.train_unsupervised(df)
-        except Exception as exc:
-            logger.error("Unsupervised training failed: %s", exc)
-            return Response(
-                {"detail": f"Unsupervised training failed: {exc}"},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
-        if "error" in metrics:
-            return Response(
-                {"detail": metrics["error"]}, status=status.HTTP_400_BAD_REQUEST
-            )
-
-        return Response({"mode": "unsupervised", **metrics})
