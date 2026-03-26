@@ -14,6 +14,8 @@ from pathlib import Path
 from datetime import timedelta
 from dotenv import load_dotenv
 import os
+from .internet_connection import check_internet_connection
+from loguru import logger
 
 load_dotenv()
 
@@ -88,19 +90,35 @@ AUTH_USER_MODEL = "zimcrimewatch.CustomUser"
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.contrib.gis.db.backends.postgis', 
-        'NAME': os.getenv('NAME'),
-        'USER': os.getenv('USER'),
-        'PASSWORD': os.getenv('PASSWORD'),
-        'HOST': os.getenv('HOST'),
-        'PORT': os.getenv('PORT'),
-        'SSL mode': os.getenv('SSL_MODE'),
-        'CA': os.getenv('CA'),
-        'CONNECTION LIMIT': os.getenv('CONNECTION_LIMIT')
+#Check internet connection if available use online database
+if check_internet_connection():
+    logger.info("Online database in session")
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.contrib.gis.db.backends.postgis', 
+            'NAME': os.getenv('NAME'),
+            'USER': os.getenv('USER'),
+            'PASSWORD': os.getenv('PASSWORD'),
+            'HOST': os.getenv('HOST'),
+            'PORT': os.getenv('PORT'),
+            'SSL mode': os.getenv('SSL_MODE'),
+            'CA': os.getenv('CA'),
+            'CONNECTION LIMIT': os.getenv('CONNECTION_LIMIT')
+        }
     }
-}
+else:
+    #Offline database
+    logger.info("Offline database in session")
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.contrib.gis.db.backends.postgis', 
+            'NAME': os.getenv('OFFLINENAME'),
+            'USER': os.getenv('OFFLINEUSER'),
+            'PASSWORD': os.getenv('OFFLINEPASSWORD'),
+            'HOST': os.getenv('OFFLINEHOST'),
+            'PORT': os.getenv('OFFLINEPORT')
+        }
+    }
 
 # POSTGIS GEOS & GDAL dll files
 GDAL_LIBRARY_PATH = r'C:\Program Files\PostgreSQL\18\bin\libgdal-35.dll'
