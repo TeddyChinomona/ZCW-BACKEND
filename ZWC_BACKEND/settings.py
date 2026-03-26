@@ -15,6 +15,7 @@ from datetime import timedelta
 from dotenv import load_dotenv
 import os
 from .internet_connection import check_internet_connection
+from .os import check_os
 from loguru import logger
 
 load_dotenv()
@@ -120,9 +121,14 @@ else:
         }
     }
 
-# POSTGIS GEOS & GDAL dll files
-GDAL_LIBRARY_PATH = r'C:\Program Files\PostgreSQL\18\bin\libgdal-35.dll'
-GEOS_LIBRARY_PATH = r'C:\Program Files\PostgreSQL\18\bin\libgeos_c.dll'
+if check_os() == "Windows":
+    # POSTGIS GEOS & GDAL dll files
+    GDAL_LIBRARY_PATH = r'C:\Program Files\PostgreSQL\18\bin\libgdal-35.dll'
+    GEOS_LIBRARY_PATH = r'C:\Program Files\PostgreSQL\18\bin\libgeos_c.dll'
+elif check_os() == "Linux":
+    # GDAL_LIBRARY_PATH = '/usr/lib/libgdal.so'
+    # GEOS_LIBRARY_PATH = '/usr/lib/x86_64-linux-gnu/libgeos_c.so'
+    pass
 
 # Password validation
 # https://docs.djangoproject.com/en/6.0/ref/settings/#auth-password-validators
