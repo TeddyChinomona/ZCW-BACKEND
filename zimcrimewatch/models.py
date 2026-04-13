@@ -146,7 +146,7 @@ class CrimeType(models.Model):
 # =============================================================================
 
 class CrimeIncident(models.Model):
-    """
+    """  
     A single crime incident reported to the ZRP.
 
     Spatial storage
@@ -195,19 +195,15 @@ class CrimeIncident(models.Model):
     )
     # ────────────────────────────────────────────────────────────────────────
 
-    suburb                = models.CharField(max_length=150, blank=True, default="")
+    suburb = models.CharField(max_length=150, blank=True, default="")
     description_narrative = models.TextField(blank=True, default="")
-    modus_operandi        = models.TextField(blank=True, default="")
-    status                = models.CharField(
-        max_length=30, choices=STATUS_CHOICES, default="reported", db_index=True
-    )
-    weapon_used   = models.CharField(max_length=100, blank=True, default="")
-    num_suspects  = models.PositiveIntegerField(default=0)
+    modus_operandi = models.TextField(blank=True, default="")
+    status = models.CharField(max_length=30, choices=STATUS_CHOICES, default="reported", db_index=True)
+    weapon_used = models.CharField(max_length=100, blank=True, default="")
+    num_suspects = models.PositiveIntegerField(default=0)
 
     # Derived / cached fields for ML feature engineering
-    time_of_day = models.CharField(
-        max_length=20, choices=TIME_OF_DAY_CHOICES, blank=True, default=""
-    )
+    time_of_day = models.CharField(max_length=20, choices=TIME_OF_DAY_CHOICES, blank=True, default="")
     day_of_week = models.CharField(max_length=10, blank=True, default="")
 
     # Serial-crime linkage (analyst-assigned)
