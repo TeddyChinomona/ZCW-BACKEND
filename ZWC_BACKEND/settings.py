@@ -17,6 +17,7 @@ import os
 from .internet_connection import check_internet_connection
 from .os import check_os
 from loguru import logger
+import dj_database_url
 
 load_dotenv()
 
@@ -98,19 +99,28 @@ AUTH_USER_MODEL = "zimcrimewatch.CustomUser"
 #Check internet connection if available use online database
 if check_internet_connection():
     logger.info("Online database in session")
-    DATABASES = {
-        'default': {
-            'ENGINE': 'django.contrib.gis.db.backends.postgis', 
-            'NAME': os.getenv('NAME'),
-            'USER': os.getenv('USER'),
-            'PASSWORD': os.getenv('PASSWORD'),
-            'HOST': os.getenv('HOST'),
-            'PORT': os.getenv('PORT'),
-            'SSL mode': os.getenv('SSL_MODE'),
-            'CA': os.getenv('CA'),
-            'CONNECTION LIMIT': os.getenv('CONNECTION_LIMIT')
+    if True:
+        DATABASES = {
+            'default': dj_database_url.config(
+                default=os.getenv('DATABASE_URL'),
+                conn_max_age=600,
+                ssl_require=True # Often required for cloud DBs
+            )
         }
-    }
+    else:
+        DATABASES = {
+            'default': {
+                'ENGINE': 'django.contrib.gis.db.backends.postgis', 
+                'NAME': os.getenv('NAME'),
+                'USER': os.getenv('USER'),
+                'PASSWORD': os.getenv('PASSWORD'),
+                'HOST': os.getenv('HOST'),
+                'PORT': os.getenv('PORT'),
+                'SSL mode': os.getenv('SSL_MODE'),
+                'CA': os.getenv('CA'),
+                'CONNECTION LIMIT': os.getenv('CONNECTION_LIMIT')
+            }
+        }
 else:
     #Offline database
     logger.info("Offline database in session")
