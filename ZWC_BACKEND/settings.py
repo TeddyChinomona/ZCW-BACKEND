@@ -40,7 +40,8 @@ ALLOWED_HOSTS = [
     'localhost',
     '192.168.1.122',
     '192.168.18.62',
-    '192.168.100.20'
+    '192.168.100.20',
+    'zcw-backend-production.up.railway.app'
 ]
 
 
