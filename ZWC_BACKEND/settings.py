@@ -103,9 +103,9 @@ if check_internet_connection():
     if True:
         DATABASES = {
             'default': dj_database_url.config(
-                default=os.getenv('DATABASE_URL'),
-                conn_max_age=600,
-                ssl_require=True, # Often required for cloud DBs
+                default=os.getenv('DATABASE_URL_RAILWAY'),
+                #conn_max_age=600,
+                #ssl_require=True, # Often required for cloud DBs
                 engine='django.contrib.gis.db.backends.postgis'
             )
         }
