@@ -773,7 +773,7 @@ class HeatmapView(APIView):
         if not coords:
             return Response({"heatmap_data": []})
 
-        result = compute_kde_heatmap(coords, bandwidth=d.get("bandwidth", 0.01))
+        result = compute_kde_heatmap(coords, bandwidth_km=d.get("bandwidth", 0.01))
         return Response({"heatmap_data": result})
 
     def get(self, request):

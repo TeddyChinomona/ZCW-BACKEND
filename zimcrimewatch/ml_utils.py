@@ -36,91 +36,154 @@ RF_MODEL_PATH = Path(__file__).parent / "ml_models" / "profile_matcher.pkl"
 # 1. KDE Heatmap  —  "How dense are crimes in each area of the map?"
 # =============================================================================
 
-def compute_kde_heatmap(coordinates, grid_size=100, bandwidth=0.05):
-    """
-    Takes a list of (latitude, longitude) crime locations and returns
-    a grid of density values for drawing a heatmap on the frontend map.
+# def compute_kde_heatmap(coordinates, grid_size=25, bandwidth=0.01):
+#     """
+#     Takes a list of (latitude, longitude) crime locations and returns
+#     a grid of density values for drawing a heatmap on the frontend map.
 
-    How it works:
-      - We fit a Kernel Density Estimator (KDE) to the crime coordinates.
-        Think of KDE as placing a small "bump" at each crime location and
-        then adding all the bumps together.  Where many crimes cluster, the
-        bumps add up to a high peak.  Sparse areas stay low.
-      - We then evaluate the density on a regular grid of points across
-        the bounding box of the data.
-      - We normalise the density to a 0-1 scale so the frontend always gets
-        consistent intensity values regardless of the number of crimes.
+#     How it works:
+#       - We fit a Kernel Density Estimator (KDE) to the crime coordinates.
+#         Think of KDE as placing a small "bump" at each crime location and
+#         then adding all the bumps together.  Where many crimes cluster, the
+#         bumps add up to a high peak.  Sparse areas stay low.
+#       - We then evaluate the density on a regular grid of points across
+#         the bounding box of the data.
+#       - We normalise the density to a 0-1 scale so the frontend always gets
+#         consistent intensity values regardless of the number of crimes.
 
-    Parameters
-    ----------
-    coordinates : list of (lat, lng) tuples
-    grid_size   : how many grid cells per axis (higher = finer detail)
-    bandwidth   : controls how wide each "bump" is, in degrees
-                  (~0.05° ≈ 5 km around Harare's latitude)
+#     Parameters
+#     ----------
+#     coordinates : list of (lat, lng) tuples
+#     grid_size   : how many grid cells per axis (higher = finer detail)
+#     bandwidth   : controls how wide each "bump" is, in degrees
+#                   (~0.05° ≈ 5 km around Harare's latitude)
 
-    Returns
-    -------
-    {
-      "points": [ {"lat": ..., "lng": ..., "intensity": 0.0-1.0}, ... ],
-      "max_intensity": float   # raw peak density before normalisation
-    }
-    """
-    from sklearn.neighbors import KernelDensity
+#     Returns
+#     -------
+#     {
+#       "points": [ {"lat": ..., "lng": ..., "intensity": 0.0-1.0}, ... ],
+#       "max_intensity": float   # raw peak density before normalisation
+#     }
+#     """
+#     from sklearn.neighbors import KernelDensity
 
-    # Nothing to do if there are no coordinates
+#     # Nothing to do if there are no coordinates
+#     if not coordinates:
+#         return {"points": [], "max_intensity": 0}
+
+#     # Convert list of tuples to a 2D numpy array  shape: (N, 2)
+#     coords = np.array(coordinates)
+
+#     # Fit the KDE to the crime locations.
+#     # KernelDensity learns where the data is dense vs sparse.
+#     kde = KernelDensity(bandwidth=bandwidth, kernel="gaussian")
+#     kde.fit(coords)
+
+#     # Build a regular grid that covers the entire dataset area.
+#     lat_min, lat_max = coords[:, 0].min(), coords[:, 0].max()
+#     lng_min, lng_max = coords[:, 1].min(), coords[:, 1].max()
+
+#     # linspace creates evenly-spaced points between the min and max.
+#     lat_grid = np.linspace(lat_min, lat_max, grid_size)
+#     lng_grid = np.linspace(lng_min, lng_max, grid_size)
+
+#     # meshgrid turns two 1-D arrays into all (lat, lng) combinations on the
+#     # grid.  grid_lat and grid_lng are both (grid_size × grid_size) matrices.
+#     grid_lat, grid_lng = np.meshgrid(lat_grid, lng_grid)
+
+#     # Flatten and zip the two matrices into a list of (lat, lng) points so we
+#     # can score all grid cells in one call  shape: (grid_size², 2)
+#     grid_points = np.column_stack([grid_lat.ravel(), grid_lng.ravel()])
+
+#     # ---- Score every grid cell with the KDE --------------------------------
+#     # KernelDensity.score_samples() returns log(density) for numerical
+#     # stability.  We exponentiate to get the actual density value.
+#     log_density = kde.score_samples(grid_points)
+#     density     = np.exp(log_density)
+
+#     # ---- Normalise density to the range [0, 1] ----------------------------
+#     max_density = density.max() if density.max() > 0 else 1.0
+#     normalised  = density / max_density
+
+#     # ---- Filter out near-zero cells to keep the API response small --------
+#     # Any cell with less than 5% of peak intensity is not worth sending.
+#     threshold = 0.05
+#     mask      = normalised > threshold
+
+#     points = [
+#         {
+#             "lat":       float(grid_points[i, 0]),
+#             "lng":       float(grid_points[i, 1]),
+#             "intensity": round(float(normalised[i]), 4),
+#         }
+#         for i in np.where(mask)[0]
+#     ]
+
+#     return {"points": points, "max_intensity": round(float(max_density), 6)}
+
+import numpy as np
+from sklearn.neighbors import KernelDensity
+
+def compute_kde_heatmap(coordinates, grid_size=100, bandwidth_km=1.5):
+    # ... [keep your excellent docstrings here] ...
+    
     if not coordinates:
         return {"points": [], "max_intensity": 0}
 
-    # Convert list of tuples to a 2D numpy array  shape: (N, 2)
     coords = np.array(coordinates)
 
-    # Fit the KDE to the crime locations.
-    # KernelDensity learns where the data is dense vs sparse.
-    kde = KernelDensity(bandwidth=bandwidth, kernel="gaussian")
-    kde.fit(coords)
+    # 1. Convert degrees to radians for Haversine metric
+    coords_rad = np.radians(coords)
+    
+    # Earth's radius in kilometers
+    EARTH_RADIUS_KM = 6371.0 
+    
+    # Bandwidth must also be converted to radians
+    bandwidth_rad = bandwidth_km / EARTH_RADIUS_KM
 
-    # Build a regular grid that covers the entire dataset area.
+    # 2. Fit KDE using spherical distance
+    kde = KernelDensity(
+        bandwidth=bandwidth_rad, 
+        kernel="gaussian", 
+        metric="haversine"
+    )
+    kde.fit(coords_rad)
+
+    # 3. Build the grid
     lat_min, lat_max = coords[:, 0].min(), coords[:, 0].max()
     lng_min, lng_max = coords[:, 1].min(), coords[:, 1].max()
 
-    # linspace creates evenly-spaced points between the min and max.
     lat_grid = np.linspace(lat_min, lat_max, grid_size)
     lng_grid = np.linspace(lng_min, lng_max, grid_size)
-
-    # meshgrid turns two 1-D arrays into all (lat, lng) combinations on the
-    # grid.  grid_lat and grid_lng are both (grid_size × grid_size) matrices.
     grid_lat, grid_lng = np.meshgrid(lat_grid, lng_grid)
 
-    # Flatten and zip the two matrices into a list of (lat, lng) points so we
-    # can score all grid cells in one call  shape: (grid_size², 2)
     grid_points = np.column_stack([grid_lat.ravel(), grid_lng.ravel()])
+    
+    # Convert grid points to radians before scoring
+    grid_points_rad = np.radians(grid_points)
 
-    # ---- Score every grid cell with the KDE --------------------------------
-    # KernelDensity.score_samples() returns log(density) for numerical
-    # stability.  We exponentiate to get the actual density value.
-    log_density = kde.score_samples(grid_points)
-    density     = np.exp(log_density)
+    # 4. Score and exponentiate
+    log_density = kde.score_samples(grid_points_rad)
+    density = np.exp(log_density)
 
-    # ---- Normalise density to the range [0, 1] ----------------------------
+    # 5. Normalise
     max_density = density.max() if density.max() > 0 else 1.0
-    normalised  = density / max_density
+    normalised = density / max_density
 
-    # ---- Filter out near-zero cells to keep the API response small --------
-    # Any cell with less than 5% of peak intensity is not worth sending.
+    # Filter and construct payload (keep threshold low if using high grid_size)
     threshold = 0.05
-    mask      = normalised > threshold
+    mask = normalised > threshold
 
     points = [
         {
-            "lat":       float(grid_points[i, 0]),
-            "lng":       float(grid_points[i, 1]),
+            "lat": float(grid_points[i, 0]),
+            "lng": float(grid_points[i, 1]),
             "intensity": round(float(normalised[i]), 4),
         }
         for i in np.where(mask)[0]
     ]
 
     return {"points": points, "max_intensity": round(float(max_density), 6)}
-
 
 # =============================================================================
 # 2. Time Series Decomposition  —  "What are the trends in crime over time?"
