@@ -515,6 +515,7 @@ class IncidentListCreateView(APIView):
 
     def get(self, request):
         qs = _filter_incidents(request)
+        logger.debug(f"Crime Profile Matching Tool: {qs.values()}")
         return Response(CrimeIncidentSerializer(qs, many=True).data)
 
     def post(self, request):
