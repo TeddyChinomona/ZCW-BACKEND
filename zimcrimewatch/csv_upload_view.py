@@ -179,6 +179,11 @@ class CSVUploadView(APIView):
                 str(row.get("time_of_day", "")).strip().lower(), "morning"
             )
 
+            try:
+                area_name = str(row.get("area", "")).strip()
+            except Exception:
+                continue
+
             # ── Build the unsaved model instance ────────────────────────
             to_create.append(CrimeIncident(
                 case_number=case_number,
@@ -190,6 +195,7 @@ class CSVUploadView(APIView):
                 time_of_day=time_of_day,
                 # pandas dayofweek: 0=Monday … 6=Sunday, matches Python convention
                 day_of_week=int(timestamp.dayofweek),
+                suburb = area_name
             ))
 
             # Track the new case_number in memory to catch intra-CSV duplicates

@@ -125,11 +125,9 @@ import numpy as np
 from sklearn.neighbors import KernelDensity
 
 def compute_kde_heatmap(coordinates, grid_size=100, bandwidth_km=1.5):
-    # ... [keep your excellent docstrings here] ...
-    
     if not coordinates:
         return {"points": [], "max_intensity": 0}
-
+    logger.warning(coordinates)
     coords = np.array(coordinates)
 
     # 1. Convert degrees to radians for Haversine metric
@@ -182,7 +180,7 @@ def compute_kde_heatmap(coordinates, grid_size=100, bandwidth_km=1.5):
         }
         for i in np.where(mask)[0]
     ]
-
+    logger.critical(points)
     return {"points": points, "max_intensity": round(float(max_density), 6)}
 
 # =============================================================================
@@ -278,6 +276,9 @@ def compute_time_series(df, period="W"):
         """
         return [None if np.isnan(v) else round(float(v), 4) for v in series]
 
+    logger.success(f"Residual data: {series_to_list(decomposition.resid)}")
+    logger.success(f"Seasonal data: {series_to_list(decomposition.seasonal)}")
+    logger.success(f"Trend data: {series_to_list(decomposition.trend)}")
     return {
         "labels":          labels,
         "observed":        observed,

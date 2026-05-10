@@ -515,6 +515,7 @@ class IncidentListCreateView(APIView):
 
     def get(self, request):
         qs = _filter_incidents(request)
+        logger.debug(f"Crime Profile Matching Tool: {qs.values('suburb')}")
         logger.debug(f"Crime Profile Matching Tool: {qs.values()}")
         return Response(CrimeIncidentSerializer(qs, many=True).data)
 
@@ -771,10 +772,12 @@ class HeatmapView(APIView):
             for inc in qs.only("location")
             if inc.location
         ]
+        logger.info(coords)
         if not coords:
             return Response({"heatmap_data": []})
 
         result = compute_kde_heatmap(coords, bandwidth_km=d.get("bandwidth", 0.01))
+        logger.warning(f"Data: {result}")
         return Response({"heatmap_data": result})
 
     def get(self, request):
